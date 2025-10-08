@@ -1,0 +1,59 @@
+# Universal Copy/Paste for Yazi
+
+Should support **Wayland**, **Xorg** and **macOS**, though tested only on wayland. 
+
+Integrates yazi copy/paste with system clipboard similar to GUI file managers.
+
+## Features
+
+- **Copy files to system clipboard** - Works with other file managers, browsers, and applications
+- **Paste files from external sources** - Supports files from other file managers and code editors (including VS Code)
+- **Image paste support** - Preserves original file extensions when possible
+- **Text paste to new file** - Automatically suggests creating new files when clipboard contains text
+- **Smart collision handling** - Manages file conflicts during paste operations
+
+
+### Notes
+
+- Native Yazi cut and paste commands work with plugin's commands
+- Native Yazi copy command ***does not*** work with plugin's paste command. It was intended to utilise plugins's file collision behavior. 
+
+
+## Installation
+
+**Requires:**
+
+- **Wayland**: `wl-clipboard` package
+- **Xorg**: `xclip` package  
+
+```bash
+ya pkg add simla/ucp.yazi
+```
+
+## Configuration
+
+> [!NOTE]
+> You need yazi 3.x for this plugin to work.
+
+```toml
+[mgr]
+prepend_keymap = [
+    { on = "p", run = "plugin ucp paste", desc = "Paste" },
+    { on = "y", run = "plugin ucp copy", desc = "Copy" }
+]
+```
+
+You can enable notifications for successful/failed operations:
+
+```toml
+[mgr]
+prepend_keymap = [
+    { on = "p", run = "plugin ucp paste notify", desc = "Paste" },
+    { on = "y", run = "plugin ucp copy notify", desc = "Copy" }
+]
+```
+
+## Credits
+
+- **Paste into a new file** taken from [boydaihungst/save-clipboard-to-file.yazi](https://github.com/boydaihungst/save-clipboard-to-file.yazi)
+- **Copy** based on [grappas/wl-clipboard.yazi](https://github.com/grappas/wl-clipboard.yazi)

@@ -27,7 +27,7 @@ Integrates yazi copy/paste with system clipboard similar to GUI file managers.
 - **Xorg**: `xclip` package  
 
 ```bash
-ya pkg add simla/ucp.yazi
+ya pkg add simla33/ucp
 ```
 
 ## Configuration

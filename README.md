@@ -21,14 +21,18 @@ Integrates yazi copy/paste with system clipboard similar to GUI file managers.
 
 ## Previews
 
-**Copy**  
-![Copy preview](https://github.com/simla33/my_assets/raw/main/ucp_copy_small.gif)
+### Copy
+![Copy preview](https://github.com/user-attachments/assets/8894ca14-402b-4885-b2b6-d9666a4661b4)
 
-**Paste**  
-![Paste preview](https://github.com/simla33/my_assets/raw/main/ucp_paste_small.gif)
+---
 
-**File collision handling & paste into new file**  
-![Collision preview](https://github.com/simla33/my_assets/raw/main/ucp_collision_small.gif)
+### Paste
+![Paste preview](https://github.com/user-attachments/assets/ae29d283-fec1-4e56-8857-c57d17c0d4f8)
+
+---
+
+### File collision handling & paste into new file
+![Collision preview](https://github.com/user-attachments/assets/92746b8d-e93e-4c0c-8bbb-7845be5f57e1)
 
 
 ## Installation

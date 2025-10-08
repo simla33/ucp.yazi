@@ -16,7 +16,19 @@ Integrates yazi copy/paste with system clipboard similar to GUI file managers.
 ### Notes
 
 - Native Yazi cut and paste commands work with plugin's commands
-- Native Yazi copy command ***does not*** work with plugin's paste command. It was intended to utilise plugins's file collision behavior. 
+- Native Yazi copy command ***does not*** work with plugin's paste command. It was intended to utilise plugins's file collision behavior.
+
+
+## Previews
+
+**Copy**  
+![Copy preview](https://github.com/simla33/my_assets/raw/main/ucp_copy_preview.gif)
+
+**Paste**  
+![Paste preview](https://github.com/simla33/my_assets/raw/main/ucp_paste_preview.gif)
+
+**File collision handling & paste into new file**  
+![Collision preview](https://github.com/simla33/my_assets/raw/main/ucp_collision_preview.gif)
 
 
 ## Installation

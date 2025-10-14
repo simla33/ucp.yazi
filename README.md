@@ -12,11 +12,7 @@ Integrates yazi copy/paste with system clipboard similar to GUI file managers.
 - **Text paste to new file** - Automatically suggests creating new files when clipboard contains text
 - **Smart collision handling** - Manages file conflicts during paste operations
 
-
-### Notes
-
-- Native Yazi cut and paste commands work with plugin's commands
-- Native Yazi copy command ***does not*** work with plugin's paste command. It was intended to utilise plugins's file collision behavior.
+- Native Yazi commands like cut and symlink work with plugin's commands
 
 
 ## Previews

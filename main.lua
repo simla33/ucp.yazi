@@ -288,41 +288,6 @@ local function get_clipboard_image_targets()
 	return nil
 end
 
-local function get_best_image_format(targets)
-	if not targets then return nil end
-
-	-- Check for image formats
-	-- (JPEG, WebP, GIF etc are more likely original than PNG which is often a conversion and included in clipboard by default)
-	if targets:match("image/jpeg") then
-		return "jpeg"
-	elseif targets:match("image/jpg") then
-		return "jpg"
-	elseif targets:match("image/webp") then
-		return "webp"
-	elseif targets:match("image/gif") then
-		return "gif"
-	elseif targets:match("image/png") then
-		return "png"
-	elseif targets:match("image/bmp") then
-		return "bmp"
-	elseif targets:match("image/tiff") then
-		return "tiff"
-	elseif targets:match("image/svg%+xml") then
-		return "svg"
-	elseif targets:match("image/") then
-		local format = targets:match("image/([%w-]+)")
-		if format then
-			return format
-		else
-			warn("Could not determine image format!")
-			return "png"
-		end
-	end
-
-	return nil
-end
-
-
 -- Detect best image format from clipboard (with priority)
 local function get_best_image_format(targets)
 	if not targets then return nil end
@@ -765,6 +730,9 @@ function M:copy_entry(job)
 			break
 		end
 	end
+
+    --support for visual mode, we call it escape before selected_or_hovered, so all files become available in tab.selected
+    ya.emit("escape", { visual = true })
 
 	-- Get selected or hovered files first
 	local urls = selected_or_hovered()

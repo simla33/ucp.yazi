@@ -7,12 +7,12 @@ Integrates yazi copy/paste with system clipboard similar to GUI file managers.
 ## Features
 
 - **Copy files to system clipboard** - Works with other file managers, browsers, and applications
-- **Paste files from external sources** - Supports files from other file managers and code editors (including VS Code)
-- **Image paste support** - Preserves original file extensions when possible
+- **Paste files from external sources** - Supports pasting files from other file managers and code editors (including VS Code)
 - **Text paste to new file** - Automatically suggests creating new files when clipboard contains text
 - **Smart collision handling** - Manages file conflicts during paste operations
 
-- Native Yazi commands like cut and symlink work with plugin's commands
+- Native Yazi commands like cut and symlink work with the plugin
+- Fallbaks to native yazi copy and paste commands so it should work anywhere yazi works
 
 
 ## Previews

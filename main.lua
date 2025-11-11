@@ -1299,7 +1299,7 @@ function M:paste_entry(job)
 	if is_cut then
 		-- If there are cut files, paste them using native command
 		ya.emit("paste", {})
-		ya.manager_emit("unyank", {})
+		ya.emit("unyank", {})
 		return
 	end
 
@@ -1316,7 +1316,7 @@ function M:paste_entry(job)
 			local file_uris = get_clipboard_file_uris()
 			if file_uris and #file_uris > 0 then
 				M:handle_file_list_paste(file_uris, no_hover, show_notify)
-				ya.manager_emit("unyank", {})
+				ya.emit("unyank", {})
 				return
 			end
 		end
@@ -1326,7 +1326,7 @@ function M:paste_entry(job)
 			local image_targets = get_clipboard_image_targets()
 			if image_targets then
 				M:handle_image_paste(image_targets, no_hover, show_notify)
-				ya.manager_emit("unyank", {})
+				ya.emit("unyank", {})
 				return
 			end
 		end
@@ -1336,7 +1336,7 @@ function M:paste_entry(job)
 			local clipboard_content = ya.clipboard()
 			if clipboard_content and clipboard_content ~= "" then
 				M:handle_text_paste(clipboard_content, no_hover, show_notify)
-				ya.manager_emit("unyank", {})
+				ya.emit("unyank", {})
 				return
 			end
 		end
@@ -1346,7 +1346,7 @@ function M:paste_entry(job)
 	-- Could be useful for using yazi in tty
 	if #yanked_files > 0 then
 		ya.emit("paste", {})
-		ya.manager_emit("unyank", {})
+		ya.emit("unyank", {})
 		return
 	end
 

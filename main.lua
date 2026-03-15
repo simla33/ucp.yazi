@@ -241,14 +241,24 @@ function M:copy_entry(job)
 
 	-- Try wl-copy first (Wayland) with text/uri-list target
 	ya.dbg("Attempting wl-copy with text/uri-list target...")
-	status, err = Command("wl-copy"):arg("--type"):arg("text/uri-list"):arg(file_list_formatted):spawn():wait()
+	local wl_child, wl_err = Command("wl-copy"):arg("--type"):arg("text/uri-list"):arg(file_list_formatted):spawn()
+	if wl_child then
+		status, err = wl_child:wait()
+	else
+		status, err = nil, wl_err
+	end
 	ya.dbg("wl-copy text/uri-list result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
 
 	-- If wl-copy fails, try pbcopy (macOS)
 	if not status or not status.success then
 		ya.dbg("wl-copy failed, trying pbcopy...")
 		-- For macOS, use the same text/uri-list format
-		status, err = Command("pbcopy"):arg(file_list_formatted):spawn():wait()
+		local pb_child, pb_err = Command("pbcopy"):arg(file_list_formatted):spawn()
+		if pb_child then
+			status, err = pb_child:wait()
+		else
+			status, err = nil, pb_err
+		end
 		ya.dbg("pbcopy result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
 	end
 
@@ -256,8 +266,12 @@ function M:copy_entry(job)
 	if not status or not status.success then
 		ya.dbg("pbcopy failed, trying xclip...")
 		-- xclip supports text/uri-list format
-		status, err = Command("xclip"):arg("-selection"):arg("clipboard"):arg("-t"):arg("text/uri-list"):arg(
-			file_list_formatted):spawn():wait()
+		local xclip_child, xclip_err = Command("xclip"):arg("-selection"):arg("clipboard"):arg("-t"):arg("text/uri-list"):arg(file_list_formatted):spawn()
+		if xclip_child then
+			status, err = xclip_child:wait()
+		else
+			status, err = nil, xclip_err
+		end
 		ya.dbg("xclip result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
 	end
 

@@ -251,15 +251,42 @@ function M:copy_entry(job)
 
 	-- If wl-copy fails, try pbcopy (macOS)
 	if not status or not status.success then
-		ya.dbg("wl-copy failed, trying pbcopy...")
-		-- For macOS, use the same text/uri-list format
-		local pb_child, pb_err = Command("pbcopy"):arg(file_list_formatted):spawn()
-		if pb_child then
-			status, err = pb_child:wait()
-		else
-			status, err = nil, pb_err
+		ya.dbg("wl-copy failed, trying osascript (JXA) for macOS...")
+		local jxa_script = [[
+function run(argv) {
+    ObjC.import("AppKit");
+    var pb = $.NSPasteboard.generalPasteboard;
+    pb.clearContents;
+    pb.declareTypesOwner($(["NSFilenamesPboardType", "public.utf8-plain-text"]), null);
+    var arr = [];
+    for(var i=0; i<argv.length; i++) arr.push(argv[i]);
+    pb.setPropertyListForType($(arr), "NSFilenamesPboardType");
+    pb.setStringForType(argv.join("\n"), "public.utf8-plain-text");
+}
+]]
+		local jxa_cmd = Command("osascript"):arg("-l"):arg("JavaScript"):arg("-e"):arg(jxa_script)
+		for _, path in ipairs(urls) do
+			jxa_cmd = jxa_cmd:arg(path)
 		end
-		ya.dbg("pbcopy result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
+		local jxa_child, jxa_err = jxa_cmd:spawn()
+		if jxa_child then
+			status, err = jxa_child:wait()
+		else
+			status, err = nil, jxa_err
+		end
+		ya.dbg("osascript JXA result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
+
+		-- If osascript JXA fails, try pbcopy
+		if not status or not status.success then
+			ya.dbg("osascript JXA failed, trying pbcopy...")
+			local pb_child, pb_err = Command("pbcopy"):arg(file_list_formatted):spawn()
+			if pb_child then
+				status, err = pb_child:wait()
+			else
+				status, err = nil, pb_err
+			end
+			ya.dbg("pbcopy result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
+		end
 	end
 
 	-- If both fail, try xclip (X11) with text/uri-list
@@ -549,8 +576,51 @@ end
 
 -- Detect if clipboard contains file URIs and extract all paths
 local function get_clipboard_file_uris()
-	-- Try macOS pbpaste first
-	local handle = io.popen("pbpaste 2>/dev/null")
+	-- Try native macOS file URLs first
+	local mac_script = [[
+osascript -l JavaScript -e '
+function run() {
+    ObjC.import("AppKit");
+    var pb = $.NSPasteboard.generalPasteboard;
+    var files = pb.propertyListForType("NSFilenamesPboardType");
+    if (files) {
+        var arr = ObjC.deepUnwrap(files);
+        if (arr && arr.length > 0) return arr.join("\n");
+    }
+    var items = pb.pasteboardItems;
+    if (!items) return "";
+    var res = [];
+    for(var i=0; i<items.count; i++) {
+        var str = items.objectAtIndex(i).stringForType("public.file-url");
+        if (str) {
+            var fileUrl = $.NSURL.URLWithString(str);
+            if (fileUrl && fileUrl.isFileURL) res.push(fileUrl.path.js);
+        }
+    }
+    return res.join("\n");
+}
+' 2>/dev/null
+]]
+	local handle = io.popen(mac_script)
+	if handle then
+		local content = handle:read("*a")
+		handle:close()
+
+		if content and content:match("^/") then
+			local file_paths = {}
+			for file_path in content:gmatch("[^\r\n]+") do
+				if file_path:match("^/") then
+					table.insert(file_paths, file_path)
+				end
+			end
+			if #file_paths > 0 then
+				return file_paths
+			end
+		end
+	end
+
+	-- Try macOS pbpaste fallback
+	handle = io.popen("pbpaste 2>/dev/null")
 	if handle then
 		local content = handle:read("*a")
 		handle:close()
@@ -1251,9 +1321,20 @@ local function get_clipboard_mimetypes()
 		handle:close()
 
 		if info then
+			local mimetypes = {}
+
+			-- Check if clipboard contains file URLs natively on macOS (e.g. from Finder)
+			local check_files = io.popen("osascript -l JavaScript -e 'function run() { ObjC.import(\"AppKit\"); var pb = $.NSPasteboard.generalPasteboard; var types = pb.types; if (!types) return \"\"; for(var i=0; i<types.count; i++) { var t = types.objectAtIndex(i).js; if (t === \"public.file-url\" || t === \"NSFilenamesPboardType\") return \"text/uri-list\"; } return \"\"; }' 2>/dev/null")
+			if check_files then
+				local is_file = check_files:read("*a")
+				check_files:close()
+				if is_file and is_file:match("text/uri%-list") then
+					table.insert(mimetypes, "text/uri-list")
+				end
+			end
+
 			-- macOS returns different format
 			-- Format: "«class PNGf», «class JPEG», picture, text" etc.
-			local mimetypes = {}
 			for item in info:gmatch("[^,]+") do
 				item = item:match("^%s*(.-)%s*$") -- trim
 				if item and item ~= "" then

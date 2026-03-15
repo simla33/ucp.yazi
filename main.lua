@@ -614,10 +614,12 @@ local function copy_directory(source_dir, target_dir, no_hover)
 		return false
 	end
 
+	local source_dir_clean = tostring(source_dir):gsub("/+$", "")
+	local source_prefix_len = #source_dir_clean + 2 -- +2 to skip the trailing slash
 	local success = true
 	for line in source_files:lines() do
 		-- Get relative path from source directory
-		local rel_path = line:gsub("^" .. source_dir:gsub("%%", "%%%%") .. "/", "")
+		local rel_path = line:sub(source_prefix_len)
 		local target_file_path = Url(pathJoin(tostring(target_dir), rel_path))
 
 		-- Read source file content
@@ -715,10 +717,12 @@ local function handle_directory_collision(dir_path, source_file_uri, source_file
 					-- Both are directories, recursively overwrite contents
 					local source_files = io.popen("find " .. source_file_uri .. " -type f 2>/dev/null")
 					if source_files then
+						local source_dir_clean = tostring(source_file_uri):gsub("/+$", "")
+						local source_prefix_len = #source_dir_clean + 2
 						local success = true
 						for line in source_files:lines() do
 							-- Get relative path from source directory
-							local rel_path = line:gsub("^" .. source_file_uri:gsub("%%", "%%%%") .. "/", "")
+							local rel_path = line:sub(source_prefix_len)
 							local target_file_path = Url(pathJoin(tostring(target_file), rel_path))
 
 							-- Read source file content

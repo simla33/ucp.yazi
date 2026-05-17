@@ -147,7 +147,7 @@ function M:entry(job)
 		ya.dbg("Calling paste_entry")
 		return M:paste_entry(job)
 	else
-		warn("Unknown action, requires copy or paste arguement")
+		warn("Unknown action, requires copy or paste argument")
 		return
 	end
 end

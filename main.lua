@@ -560,9 +560,9 @@ local function handle_text_uri_list_paste(content)
 		ya.dbg("text/uri-list content:", uri_content or "empty")
 
 		local file_paths = {}
-		for file_path in uri_content:gmatch("file://([^\r\n]+)") do
+		for raw_path in uri_content:gmatch("file://([^\r\n]+)") do
 			-- URL decode the path
-			file_path = file_path:gsub("%%(%x%x)", function(hex)
+			local file_path = raw_path:gsub("%%(%x%x)", function(hex)
 				return string.char(tonumber(hex, 16))
 			end)
 			table.insert(file_paths, file_path)
@@ -1335,8 +1335,8 @@ local function get_clipboard_mimetypes()
 
 			-- macOS returns different format
 			-- Format: "«class PNGf», «class JPEG», picture, text" etc.
-			for item in info:gmatch("[^,]+") do
-				item = item:match("^%s*(.-)%s*$") -- trim
+			for raw_item in info:gmatch("[^,]+") do
+				local item = raw_item:match("^%s*(.-)%s*$") -- trim
 				if item and item ~= "" then
 					table.insert(mimetypes, item)
 				end
@@ -1359,8 +1359,8 @@ local function get_clipboard_mimetypes()
 	if targets then
 		-- Split targets by newline and return as array
 		local mimetypes = {}
-		for mimetype in targets:gmatch("[^\r\n]+") do
-			mimetype = mimetype:match("^%s*(.-)%s*$") -- trim
+		for raw_mime in targets:gmatch("[^\r\n]+") do
+			local mimetype = raw_mime:match("^%s*(.-)%s*$") -- trim
 			if mimetype and mimetype ~= "" then
 				table.insert(mimetypes, mimetype)
 			end

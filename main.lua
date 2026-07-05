@@ -520,6 +520,16 @@ local function escape_lua_pattern(s)
 	return s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
 end
 
+local function normalize_directory_path(path)
+	return tostring(path):gsub("/+$", "")
+end
+
+local function relative_path_from_directory(path, directory)
+	local normalized_directory = normalize_directory_path(directory)
+	local rel_path = tostring(path):gsub("^" .. escape_lua_pattern(normalized_directory) .. "/", "")
+	return rel_path
+end
+
 -- handle code/file-list clipboard mimetype
 local function handle_code_file_list_paste(content)
 	ya.dbg("Found code/file-list target, attempting to read...")
@@ -687,7 +697,8 @@ local function copy_directory(source_dir, target_dir, no_hover)
 	end
 	fs.create("dir", target_dir)
 
-	local source_dir_escaped = tostring(source_dir):gsub("'", "'\\''")
+	local normalized_source_dir = normalize_directory_path(source_dir)
+	local source_dir_escaped = normalized_source_dir:gsub("'", "'\\''")
 	local source_files = io.popen("find '" .. source_dir_escaped .. "' -type f 2>/dev/null")
 	if not source_files then
 		return false
@@ -696,7 +707,7 @@ local function copy_directory(source_dir, target_dir, no_hover)
 	local success = true
 	for line in source_files:lines() do
 		-- Get relative path from source directory
-		local rel_path = line:gsub("^" .. escape_lua_pattern(tostring(source_dir)) .. "/", "")
+		local rel_path = relative_path_from_directory(line, normalized_source_dir)
 		local target_file_path = Url(pathJoin(tostring(target_dir), rel_path))
 
 		-- Read source file content
@@ -785,7 +796,7 @@ local function handle_directory_collision(dir_path, source_file_uri, source_file
 		if not removed and err and tostring(err):match("Is a directory") then
 			-- Target is also a directory, recursively overwrite contents
 			-- Check if source is also a directory
-			local source_uri_esc = tostring(source_file_uri):gsub("'", "'\\''")
+			local source_uri_esc = normalize_directory_path(source_file_uri):gsub("'", "'\\''")
 			local source_dir_check = io.popen("test -d '" .. source_uri_esc .. "' && echo dir || echo file 2>/dev/null")
 			if source_dir_check then
 				local result = source_dir_check:read("*a")
@@ -798,7 +809,7 @@ local function handle_directory_collision(dir_path, source_file_uri, source_file
 						local success = true
 						for line in source_files:lines() do
 							-- Get relative path from source directory
-							local rel_path = line:gsub("^" .. escape_lua_pattern(source_file_uri) .. "/", "")
+							local rel_path = relative_path_from_directory(line, source_file_uri)
 							local target_file_path = Url(pathJoin(tostring(target_file), rel_path))
 
 							-- Read source file content

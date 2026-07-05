@@ -416,7 +416,14 @@ local function get_clipboard_image_data(format)
 		if has_macos_image_type(info) then
 			-- pbpaste can return empty data for macOS image pasteboard entries.
 			-- Ask AppleScript to write PNG data to a temporary file, then read it back.
-			local temp_file = os.tmpname() .. ".png"
+			local mktemp = io.popen('mktemp "${TMPDIR:-/tmp}/ucp-yazi-image.XXXXXX" 2>/dev/null')
+			local temp_file = mktemp and mktemp:read("*l") or nil
+			if mktemp then
+				mktemp:close()
+			end
+			if not temp_file or temp_file == "" then
+				return nil
+			end
 			local apple_path = temp_file:gsub("\\", "\\\\"):gsub('"', '\\"')
 			local cmd = string.format(
 				"osascript "

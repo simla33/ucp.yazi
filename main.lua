@@ -235,38 +235,61 @@ function M:copy_entry(job)
 
 	ya.dbg("file_list_formatted: %s", file_list_formatted)
 
-	-- Try different clipboard commands based on platform
-	local status, err = nil, nil
-
-	-- Try wl-copy first (Wayland) with text/uri-list target
-	ya.dbg("Attempting wl-copy with text/uri-list target...")
-	status, err = Command("wl-copy"):arg("--type"):arg("text/uri-list"):arg(file_list_formatted):spawn():wait()
-	ya.dbg(
-		"wl-copy text/uri-list result: status=%s, err=%s",
-		status and tostring(status.success) or "nil",
-		err or "nil"
-	)
-
-	-- If wl-copy fails, try pbcopy (macOS)
-	if not status or not status.success then
-		ya.dbg("wl-copy failed, trying pbcopy...")
-		-- For macOS, use the same text/uri-list format
-		status, err = Command("pbcopy"):arg(file_list_formatted):spawn():wait()
-		ya.dbg("pbcopy result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
+	-- Spawn clipboard helpers defensively since platform-specific tools may be absent.
+	local function spawn_and_wait(command)
+		local child, spawn_err = command:spawn()
+		if not child then
+			return nil, spawn_err
+		end
+		return child:wait()
 	end
 
-	-- If both fail, try xclip (X11) with text/uri-list
+	local status, err = nil, nil
+
+	-- Try the native macOS pasteboard first. Adapted from PR #9.
+	local jxa_script = [[
+function run(argv) {
+    ObjC.import("AppKit");
+    var pb = $.NSPasteboard.generalPasteboard;
+    pb.clearContents;
+    pb.declareTypesOwner($(["NSFilenamesPboardType", "public.utf8-plain-text"]), null);
+    var paths = [];
+    for (var i = 0; i < argv.length; i++) paths.push(argv[i]);
+    pb.setPropertyListForType($(paths), "NSFilenamesPboardType");
+    pb.setStringForType(argv.join("\n"), "public.utf8-plain-text");
+}
+]]
+	local jxa_cmd = Command("osascript"):arg("-l"):arg("JavaScript"):arg("-e"):arg(jxa_script)
+	for _, path in ipairs(urls) do
+		jxa_cmd = jxa_cmd:arg(path)
+	end
+	status, err = spawn_and_wait(jxa_cmd)
+	ya.dbg("osascript JXA result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
+
+	-- Fall back to Wayland.
 	if not status or not status.success then
-		ya.dbg("pbcopy failed, trying xclip...")
-		-- xclip supports text/uri-list format
-		status, err = Command("xclip")
-			:arg("-selection")
-			:arg("clipboard")
-			:arg("-t")
-			:arg("text/uri-list")
-			:arg(file_list_formatted)
-			:spawn()
-			:wait()
+		ya.dbg("osascript JXA failed, trying wl-copy...")
+		status, err = spawn_and_wait(
+			Command("wl-copy"):arg("--type"):arg("text/uri-list"):arg(file_list_formatted)
+		)
+		ya.dbg(
+			"wl-copy text/uri-list result: status=%s, err=%s",
+			status and tostring(status.success) or "nil",
+			err or "nil"
+		)
+	end
+
+	-- Fall back to X11.
+	if not status or not status.success then
+		ya.dbg("wl-copy failed, trying xclip...")
+		status, err = spawn_and_wait(
+			Command("xclip")
+				:arg("-selection")
+				:arg("clipboard")
+				:arg("-t")
+				:arg("text/uri-list")
+				:arg(file_list_formatted)
+		)
 		ya.dbg("xclip result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
 	end
 
@@ -1444,11 +1467,9 @@ function M:paste_entry(job)
 		end
 	end
 
-	-- 1: Check if there are yanked files in the app state
-	local yanked_files, is_cut = yanked_info(job.args[1])
-
-	if is_cut then
-		-- If there are cut files, paste them using native command
+	-- Internal Yazi yank/cut always wins over stale system clipboard contents.
+	local yanked_files = yanked_info(job.args[1])
+	if #yanked_files > 0 then
 		ya.emit("paste", {})
 		ya.emit("unyank", {})
 		return
@@ -1469,11 +1490,6 @@ function M:paste_entry(job)
 			local file_uris = get_clipboard_file_uris()
 			if file_uris and #file_uris > 0 then
 				M:handle_file_list_paste(file_uris, no_hover, show_notify)
-				ya.emit("unyank", {})
-				return
-			end
-			if #yanked_files > 0 then
-				ya.emit("paste", {})
 				ya.emit("unyank", {})
 				return
 			end
@@ -1502,14 +1518,6 @@ function M:paste_entry(job)
 				return
 			end
 		end
-	end
-
-	-- Fallback: Natively paste yanked files if there were any
-	-- Could be useful for using yazi in tty
-	if #yanked_files > 0 then
-		ya.emit("paste", {})
-		ya.emit("unyank", {})
-		return
 	end
 
 	warn("Clipboard does not contain any supported mimetypes")

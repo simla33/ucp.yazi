@@ -235,38 +235,61 @@ function M:copy_entry(job)
 
 	ya.dbg("file_list_formatted: %s", file_list_formatted)
 
-	-- Try different clipboard commands based on platform
-	local status, err = nil, nil
-
-	-- Try wl-copy first (Wayland) with text/uri-list target
-	ya.dbg("Attempting wl-copy with text/uri-list target...")
-	status, err = Command("wl-copy"):arg("--type"):arg("text/uri-list"):arg(file_list_formatted):spawn():wait()
-	ya.dbg(
-		"wl-copy text/uri-list result: status=%s, err=%s",
-		status and tostring(status.success) or "nil",
-		err or "nil"
-	)
-
-	-- If wl-copy fails, try pbcopy (macOS)
-	if not status or not status.success then
-		ya.dbg("wl-copy failed, trying pbcopy...")
-		-- For macOS, use the same text/uri-list format
-		status, err = Command("pbcopy"):arg(file_list_formatted):spawn():wait()
-		ya.dbg("pbcopy result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
+	-- Spawn clipboard helpers defensively since platform-specific tools may be absent.
+	local function spawn_and_wait(command)
+		local child, spawn_err = command:spawn()
+		if not child then
+			return nil, spawn_err
+		end
+		return child:wait()
 	end
 
-	-- If both fail, try xclip (X11) with text/uri-list
+	local status, err = nil, nil
+
+	-- Try the native macOS pasteboard first. Adapted from PR #9.
+	local jxa_script = [[
+function run(argv) {
+    ObjC.import("AppKit");
+    var pb = $.NSPasteboard.generalPasteboard;
+    pb.clearContents;
+    pb.declareTypesOwner($(["NSFilenamesPboardType", "public.utf8-plain-text"]), null);
+    var paths = [];
+    for (var i = 0; i < argv.length; i++) paths.push(argv[i]);
+    pb.setPropertyListForType($(paths), "NSFilenamesPboardType");
+    pb.setStringForType(argv.join("\n"), "public.utf8-plain-text");
+}
+]]
+	local jxa_cmd = Command("osascript"):arg("-l"):arg("JavaScript"):arg("-e"):arg(jxa_script)
+	for _, path in ipairs(urls) do
+		jxa_cmd = jxa_cmd:arg(path)
+	end
+	status, err = spawn_and_wait(jxa_cmd)
+	ya.dbg("osascript JXA result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
+
+	-- Fall back to Wayland.
 	if not status or not status.success then
-		ya.dbg("pbcopy failed, trying xclip...")
-		-- xclip supports text/uri-list format
-		status, err = Command("xclip")
-			:arg("-selection")
-			:arg("clipboard")
-			:arg("-t")
-			:arg("text/uri-list")
-			:arg(file_list_formatted)
-			:spawn()
-			:wait()
+		ya.dbg("osascript JXA failed, trying wl-copy...")
+		status, err = spawn_and_wait(
+			Command("wl-copy"):arg("--type"):arg("text/uri-list"):arg(file_list_formatted)
+		)
+		ya.dbg(
+			"wl-copy text/uri-list result: status=%s, err=%s",
+			status and tostring(status.success) or "nil",
+			err or "nil"
+		)
+	end
+
+	-- Fall back to X11.
+	if not status or not status.success then
+		ya.dbg("wl-copy failed, trying xclip...")
+		status, err = spawn_and_wait(
+			Command("xclip")
+				:arg("-selection")
+				:arg("clipboard")
+				:arg("-t")
+				:arg("text/uri-list")
+				:arg(file_list_formatted)
+		)
 		ya.dbg("xclip result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
 	end
 
@@ -332,6 +355,14 @@ end)
 -- Paste Images BEGIN
 --==============================================================================
 
+local function has_macos_image_type(info)
+	return info
+		and (info:match("picture")
+			or info:find("«class PNGf»", 1, true)
+			or info:find("«class JPEG»", 1, true)
+			or info:find("«class TIFF»", 1, true))
+end
+
 -- Get all available image formats from clipboard
 local function get_clipboard_image_targets()
 	-- Try macOS first
@@ -340,7 +371,7 @@ local function get_clipboard_image_targets()
 		local info = handle:read("*a")
 		handle:close()
 
-		if info and info:match("picture") then
+		if has_macos_image_type(info) then
 			-- macOS has image in clipboard, return a generic image target
 			-- We'll detect the actual format when getting the data
 			return "image/png image/jpeg image/tiff image/gif"
@@ -405,25 +436,52 @@ local function get_clipboard_image_data(format)
 		local info = handle:read("*a")
 		handle:close()
 
-		if info and info:match("picture") then
-			-- macOS has image in clipboard, save it to a temporary file and read it
-			local temp_file = "/tmp/yazi_clipboard_image." .. format
-			local save_cmd = string.format(
-				"osascript -e 'set the clipboard to (read (POSIX file \"%s\") as «class PNGf»)' 2>/dev/null || osascript -e 'set the clipboard to (read (POSIX file \"%s\") as «class JPEG»)' 2>/dev/null",
-				temp_file,
-				temp_file
+		if has_macos_image_type(info) then
+			-- pbpaste can return empty data for macOS image pasteboard entries.
+			-- Ask AppleScript to write PNG data to a temporary file, then read it back.
+			local mktemp = io.popen('mktemp "${TMPDIR:-/tmp}/ucp-yazi-image.XXXXXX" 2>/dev/null')
+			local temp_file = mktemp and mktemp:read("*l") or nil
+			if mktemp then
+				mktemp:close()
+			end
+			if not temp_file or temp_file == "" then
+				return nil
+			end
+			local apple_path = temp_file:gsub("\\", "\\\\"):gsub('"', '\\"')
+			local cmd = string.format(
+				"osascript "
+					.. "-e 'set outPath to POSIX file \"%s\"' "
+					.. "-e 'set imgData to (the clipboard as «class PNGf»)' "
+					.. "-e 'set f to open for access outPath with write permission' "
+					.. "-e 'try' "
+					.. "-e 'set eof of f to 0' "
+					.. "-e 'write imgData to f' "
+					.. "-e 'close access f' "
+					.. "-e 'on error errMsg number errNum' "
+					.. "-e 'try' "
+					.. "-e 'close access f' "
+					.. "-e 'end try' "
+					.. "-e 'error errMsg number errNum' "
+					.. "-e 'end try' 2>/dev/null",
+				apple_path
 			)
 
-			-- First, try to get the image data using pbpaste with different formats
-			local pbpaste_cmd =
-				"pbpaste -Prefer png 2>/dev/null || pbpaste -Prefer jpeg 2>/dev/null || pbpaste 2>/dev/null"
-			handle = io.popen(pbpaste_cmd)
+			handle = io.popen(cmd)
 			if handle then
-				local data = handle:read("*a")
+				handle:read("*a")
 				handle:close()
+			end
+
+			local file = io.open(temp_file, "rb")
+			if file then
+				local data = file:read("*a")
+				file:close()
+				os.remove(temp_file)
 				if data and #data > 0 then
 					return data
 				end
+			else
+				os.remove(temp_file)
 			end
 		end
 	end
@@ -483,6 +541,16 @@ end
 --==============================================================================
 local function escape_lua_pattern(s)
 	return s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+end
+
+local function normalize_directory_path(path)
+	return tostring(path):gsub("/+$", "")
+end
+
+local function relative_path_from_directory(path, directory)
+	local normalized_directory = normalize_directory_path(directory)
+	local rel_path = tostring(path):gsub("^" .. escape_lua_pattern(normalized_directory) .. "/", "")
+	return rel_path
 end
 
 -- handle code/file-list clipboard mimetype
@@ -545,24 +613,72 @@ end
 
 -- Detect if clipboard contains file URIs and extract all paths
 local function get_clipboard_file_uris()
-	-- Try macOS pbpaste first
-	local handle = io.popen("pbpaste 2>/dev/null")
+	local function file_url_to_path(value)
+		local path = value:match("^%s*(.-)%s*$")
+		if not path or path == "" then
+			return nil
+		end
+
+		if path:match("^file://") then
+			path = path:gsub("^file://localhost", "")
+			path = path:gsub("^file://", "")
+			path = path:gsub("%%(%x%x)", function(hex)
+				return string.char(tonumber(hex, 16))
+			end)
+		end
+
+		if path:match("^/") then
+			return path
+		end
+
+		return nil
+	end
+
+	local function collect_paths(content)
+		local file_paths = {}
+		if not content or content == "" then
+			return file_paths
+		end
+
+		for item in content:gmatch("[^\r\n]+") do
+			local path = file_url_to_path(item)
+			if path then
+				table.insert(file_paths, path)
+			end
+		end
+
+		return file_paths
+	end
+
+	-- Finder-copied files are available as macOS file URLs, not plain pbpaste text.
+	local handle = io.popen("osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/null")
 	if handle then
 		local content = handle:read("*a")
 		handle:close()
+		local file_paths = collect_paths(content)
+		if #file_paths > 0 then
+			return file_paths
+		end
+	end
 
-		if content and content:match("^/") then
-			-- macOS pbpaste returns file paths directly when files are copied
-			local file_paths = {}
-			for file_path in content:gmatch("[^\r\n]+") do
-				-- Only include absolute paths (starting with /)
-				if file_path:match("^/") then
-					table.insert(file_paths, file_path)
-				end
-			end
-			if #file_paths > 0 then
-				return file_paths
-			end
+	handle = io.popen("pbpaste -Prefer public.file-url 2>/dev/null")
+	if handle then
+		local content = handle:read("*a")
+		handle:close()
+		local file_paths = collect_paths(content)
+		if #file_paths > 0 then
+			return file_paths
+		end
+	end
+
+	-- Try macOS plain text paths as a last local fallback.
+	handle = io.popen("pbpaste 2>/dev/null")
+	if handle then
+		local content = handle:read("*a")
+		handle:close()
+		local file_paths = collect_paths(content)
+		if #file_paths > 0 then
+			return file_paths
 		end
 	end
 
@@ -604,7 +720,8 @@ local function copy_directory(source_dir, target_dir, no_hover)
 	end
 	fs.create("dir", target_dir)
 
-	local source_dir_escaped = tostring(source_dir):gsub("'", "'\\''")
+	local normalized_source_dir = normalize_directory_path(source_dir)
+	local source_dir_escaped = normalized_source_dir:gsub("'", "'\\''")
 	local source_files = io.popen("find '" .. source_dir_escaped .. "' -type f 2>/dev/null")
 	if not source_files then
 		return false
@@ -613,7 +730,7 @@ local function copy_directory(source_dir, target_dir, no_hover)
 	local success = true
 	for line in source_files:lines() do
 		-- Get relative path from source directory
-		local rel_path = line:gsub("^" .. escape_lua_pattern(tostring(source_dir)) .. "/", "")
+		local rel_path = relative_path_from_directory(line, normalized_source_dir)
 		local target_file_path = Url(pathJoin(tostring(target_dir), rel_path))
 
 		-- Read source file content
@@ -702,7 +819,7 @@ local function handle_directory_collision(dir_path, source_file_uri, source_file
 		if not removed and err and tostring(err):match("Is a directory") then
 			-- Target is also a directory, recursively overwrite contents
 			-- Check if source is also a directory
-			local source_uri_esc = tostring(source_file_uri):gsub("'", "'\\''")
+			local source_uri_esc = normalize_directory_path(source_file_uri):gsub("'", "'\\''")
 			local source_dir_check = io.popen("test -d '" .. source_uri_esc .. "' && echo dir || echo file 2>/dev/null")
 			if source_dir_check then
 				local result = source_dir_check:read("*a")
@@ -715,7 +832,7 @@ local function handle_directory_collision(dir_path, source_file_uri, source_file
 						local success = true
 						for line in source_files:lines() do
 							-- Get relative path from source directory
-							local rel_path = line:gsub("^" .. escape_lua_pattern(source_file_uri) .. "/", "")
+							local rel_path = relative_path_from_directory(line, source_file_uri)
 							local target_file_path = Url(pathJoin(tostring(target_file), rel_path))
 
 							-- Read source file content
@@ -1276,16 +1393,25 @@ local function get_clipboard_mimetypes()
 		local info = handle:read("*a")
 		handle:close()
 
-		if info then
-			-- macOS returns different format
-			-- Format: "«class PNGf», «class JPEG», picture, text" etc.
+		if info and info ~= "" then
 			local mimetypes = {}
-			for item in info:gmatch("[^,]+") do
-				local trimmed_item = item:match("^%s*(.-)%s*$") -- trim
-				if trimmed_item and trimmed_item ~= "" then
-					table.insert(mimetypes, trimmed_item)
-				end
+
+			if info:find("«class furl»", 1, true) or info:find("«class alis»", 1, true) then
+				table.insert(mimetypes, "text/uri-list")
 			end
+
+			if has_macos_image_type(info) then
+				table.insert(mimetypes, "image/png")
+			end
+
+			if info:find("«class utf8»", 1, true)
+				or info:find("«class ut16»", 1, true)
+				or info:find("string", 1, true)
+				or info:find("Unicode text", 1, true)
+				or info:find("text", 1, true) then
+				table.insert(mimetypes, "text/plain")
+			end
+
 			if #mimetypes > 0 then
 				return mimetypes
 			end
@@ -1341,11 +1467,9 @@ function M:paste_entry(job)
 		end
 	end
 
-	-- 1: Check if there are yanked files in the app state
-	local yanked_files, is_cut = yanked_info(job.args[1])
-
-	if is_cut then
-		-- If there are cut files, paste them using native command
+	-- Internal Yazi yank/cut always wins over stale system clipboard contents.
+	local yanked_files = yanked_info(job.args[1])
+	if #yanked_files > 0 then
 		ya.emit("paste", {})
 		ya.emit("unyank", {})
 		return
@@ -1369,11 +1493,6 @@ function M:paste_entry(job)
 				ya.emit("unyank", {})
 				return
 			end
-			if #yanked_files > 0 then
-				ya.emit("paste", {})
-				ya.emit("unyank", {})
-			end
-			return
 		end
 
 		-- 3: Handle image/* mimetype
@@ -1399,14 +1518,6 @@ function M:paste_entry(job)
 				return
 			end
 		end
-	end
-
-	-- Fallback: Natively paste yanked files if there were any
-	-- Could be useful for using yazi in tty
-	if #yanked_files > 0 then
-		ya.emit("paste", {})
-		ya.emit("unyank", {})
-		return
 	end
 
 	warn("Clipboard does not contain any supported mimetypes")

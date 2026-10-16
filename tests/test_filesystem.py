@@ -155,15 +155,16 @@ class FilesystemSafety(IntegrationTest):
         self.no_staging()
 
     def test_shell_metacharacters_in_file_directory_collision_are_literal(self):
-        name = "literal;touch UCP_INJECTED;#"
+        name = 'literal;touch "${TMPDIR}UCP_INJECTED";#'
         source = self.write(self.src / name, b"literal filename bytes")
         keep = self.write(self.dst / name / "keep", b"unrelated destination bytes")
+        nested_keep = self.write(self.dst / name / name / "keep", b"nested directory bytes")
         self.paste([source], b"o")
-        self.assertEqual((self.dst / name / name).read_bytes(), b"literal filename bytes")
+        self.assertEqual((self.dst / name / name / name).read_bytes(), b"literal filename bytes")
         self.assertEqual(keep.read_bytes(), b"unrelated destination bytes")
+        self.assertEqual(nested_keep.read_bytes(), b"nested directory bytes")
         self.assertEqual(source.read_bytes(), b"literal filename bytes")
-        for directory in (self.root, self.src, self.dst):
-            self.assertFalse((directory / "UCP_INJECTED").exists())
+        self.assertFalse((self.root / "tmpUCP_INJECTED").exists())
         self.no_staging()
 
     def test_unreadable_source_does_not_delete_existing_directory(self):

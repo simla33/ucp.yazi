@@ -1,87 +1,13 @@
 --[[
-================================================================================
-UNIVERSAL COPY PASTE PLUGIN FOR YAZI
-================================================================================
+Universal Copy/Paste for Yazi
 
-Contents:
+    plugin ucp copy [notify]
+    plugin ucp paste [notify]
 
-- Helpers
-- Entry
-- Copy
-- Paste Images
-- Paste List
-- Paste Text To File
-- Paste Entry
-
-
-USAGE:
-- Copy: plugin ucp copy [notify]
-- Paste: plugin ucp paste [notify]
-
-[notify] is optional and will show a notification when the action is successful or failed.
-
-              ┌─────────────────┐
-              │ M:paste_entry() │
-              └─────────────────┘
-                      │
-                      ∨
-              ┌─────────────────┐           ┌─────────────────┐           ┌─────────────────┐
-              │     check_y()   │           │                 │           │                 │
-              │                 │           │                 │           │                 │
-              │  Does yazi has  │    YES    │  Are these      │    YES    │  Paste using    │
-              │  yanked files   │──────────>│  files cut? 	  │──────────>│  native yazi    │
-              │  in app state?  │           │                 │           │  command        │
-              │                 │           │                 │           │                 │
-              │                 │           │                 │           │       END       │
-              └─────────────────┘           └─────────────────┘           └─────────────────┘
-                      │                              │
-                NO    │                              │ NO
-                      ∨                              ∨
-              ┌─────────────────┐           ┌─────────────────┐
-           	  │  				│	     handle_file_list_paste()
-              │ Able to extract │           │                 │
-              │ file list from  │    YES    │ Check for       │
-              │ text/uri-list   │──────────>│ collisions and  │
-              │ or              │           │ paste using fs  │
-              │ code/file-list? │           │                 │
-              │ 				│           │       END       │
-              └─────────────────┘           └─────────────────┘
-                      │
-                NO    │
-                      ∨
-              ┌─────────────────┐           ┌─────────────────┐
-         	  │ 				│	        handle_image_paste()
-              │                 │           │                 │
-              │  Clipboard has  │    YES    │ Determines image│
-              │  mimetype       │──────────>│ format and      │
-              │  image/*?       │           │ assigns timestamp
-              │                 │           │ before pasting  │
-              │                 │           │ to file     END │
-              └─────────────────┘           └─────────────────┘
-                      │
-                NO    │
-                      ∨
-              ┌─────────────────┐           ┌─────────────────┐
-              │                 │           handle_text_paste()
-              │                 │           │                 │
-              │  Clipboard has  │    YES    │ Suggest pasting │
-              │  any text?      │──────────>│ into new file   │
-              │                 │           │                 │
-              │                 │           │                 │
-              │                 │           │       END       │
-              └─────────────────┘           └─────────────────┘
-                      │
-                NO    │
-                      ∨
-              ┌─────────────────┐
-              │ Display:        │
-              │ Clipboard does  │
-              │ not contain any │
-              │ supported       │
-              │ mimetypes  END  │
-              └─────────────────┘
-
-================================================================================
+Native cuts use Yazi's paste command. Otherwise, external file URLs, images,
+and text take precedence over internal copied files. Unsupported clipboard
+data falls back to native yank state. See README.md for collision semantics,
+staging/recovery guarantees, platform requirements, and verification limits.
 ]]
 
 local M = {}
@@ -190,102 +116,95 @@ local selected_or_hovered = ya.sync(function()
 	return paths
 end)
 
--- Entry function for copying selected files to clipboard
-function M:copy_entry(job)
-	ya.dbg("copy_entry called")
+local function command_output(program, args)
+	local output = Command(program):arg(args):output()
+	if output and output.status.success then
+		return output.stdout
+	end
+end
 
+local function command_input(program, args, content)
+	local child, err = Command(program):arg(args):stdin(Command.PIPED):spawn()
+	if not child then
+		return nil, err
+	end
+	local ok
+	ok, err = child:write_all(content)
+	if ok then
+		ok, err = child:flush()
+	end
+	if not ok then
+		child:start_kill()
+		child:wait()
+		return nil, err
+	end
+	-- wait closes stdin after flushing, allowing the clipboard owner to detach.
+	return child:wait()
+end
+
+local function linux_backends()
+	if os.getenv("WAYLAND_DISPLAY") then
+		return { "wayland", "x11" }
+	end
+	return { "x11", "wayland" }
+end
+
+local MAC_COPY = [[
+ObjC.import('AppKit');
+function run() {
+    var data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+    var text = ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding));
+    var urls = text.split(/\r?\n/).filter(function(s) { return s.length > 0; })
+        .map(function(s) { return $.NSURL.URLWithString(s); });
+    var pb = $.NSPasteboard.generalPasteboard;
+    pb.clearContents;
+    if (!pb.writeObjects(urls)) throw new Error('Cannot write file URLs to clipboard');
+}
+]]
+
+function M:copy_entry(job)
 	local show_notify = false
 	for _, arg in ipairs(job.args or {}) do
-		if arg == "notify" then
-			show_notify = true
-			break
-		end
+		show_notify = show_notify or arg == "notify"
 	end
-
-	--support for visual mode, we call it escape before selected_or_hovered, so all files become available in tab.selected
 	ya.emit("escape", { visual = true })
-
-	-- Get selected or hovered files first
-	local urls = selected_or_hovered()
-	ya.dbg("urls:", table.concat(urls, ", "))
-	ya.dbg("urls length:", #urls)
-
-	if #urls == 0 then
+	local paths = selected_or_hovered()
+	if #paths == 0 then
 		if show_notify then
-			ya.warn("No file selected")
+			warn("No file selected")
 		end
 		return
 	end
-
-	-- Call yank to highlight selected files for visual feedback
 	ya.emit("yank", {})
 
-	-- Format the URLs for `text/uri-list` specification
-	local function encode_uri(uri)
-		return uri:gsub("([^%w%-%._~:/])", function(c)
-			return string.format("%%%02X", string.byte(c))
+	local uris = {}
+	for _, path in ipairs(paths) do
+		uris[#uris + 1] = "file://" .. path:gsub("([^A-Za-z0-9%-%._~/])", function(c)
+			return string.format("%%%02X", c:byte())
 		end)
 	end
-
-	local file_list_formatted = ""
-	for _, path in ipairs(urls) do
-		-- Each file path must be URI-encoded and prefixed with "file://"
-		file_list_formatted = file_list_formatted .. "file://" .. encode_uri(path) .. "\r\n"
-	end
-
-	ya.dbg("file_list_formatted: %s", file_list_formatted)
-
-	-- Try different clipboard commands based on platform
-	local status, err = nil, nil
-
-	-- Try wl-copy first (Wayland) with text/uri-list target
-	ya.dbg("Attempting wl-copy with text/uri-list target...")
-	status, err = Command("wl-copy"):arg("--type"):arg("text/uri-list"):arg(file_list_formatted):spawn():wait()
-	ya.dbg(
-		"wl-copy text/uri-list result: status=%s, err=%s",
-		status and tostring(status.success) or "nil",
-		err or "nil"
-	)
-
-	-- If wl-copy fails, try pbcopy (macOS)
+	local content = table.concat(uris, "\r\n") .. "\r\n"
+	local status, err = command_input("osascript", { "-l", "JavaScript", "-e", MAC_COPY }, content)
 	if not status or not status.success then
-		ya.dbg("wl-copy failed, trying pbcopy...")
-		-- For macOS, use the same text/uri-list format
-		status, err = Command("pbcopy"):arg(file_list_formatted):spawn():wait()
-		ya.dbg("pbcopy result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
-	end
-
-	-- If both fail, try xclip (X11) with text/uri-list
-	if not status or not status.success then
-		ya.dbg("pbcopy failed, trying xclip...")
-		-- xclip supports text/uri-list format
-		status, err = Command("xclip")
-			:arg("-selection")
-			:arg("clipboard")
-			:arg("-t")
-			:arg("text/uri-list")
-			:arg(file_list_formatted)
-			:spawn()
-			:wait()
-		ya.dbg("xclip result: status=%s, err=%s", status and tostring(status.success) or "nil", err or "nil")
-	end
-
-	if show_notify then
-		if status and status.success then
-			ya.notify({
-				title = PackageName,
-				content = "Successfully copied the file(s) to system clipboard",
-				level = "info",
-				timeout = 5,
-			})
-		else
-			ya.notify({
-				title = PackageName,
-				content = string.format("Could not copy selected file(s) %s", status and status.code or err),
-				level = "error",
-				timeout = 5,
-			})
+		for _, backend in ipairs(linux_backends()) do
+			if backend == "wayland" then
+				status, err = command_input("wl-copy", { "--type", "text/uri-list" }, content)
+			else
+				status, err = command_input("xclip", { "-selection", "clipboard", "-t", "text/uri-list" }, content)
+			end
+			if status and status.success then
+				break
+			end
 		end
+	end
+	if show_notify then
+		ya.notify({
+			title = PackageName,
+			content = status and status.success and "Successfully copied the file(s) to system clipboard"
+				or ("Could not copy selected file(s): " .. tostring(err or (status and status.code))),
+			level = status and status.success and "info" or "error",
+			timeout = 5,
+		})
 	end
 end
 
@@ -296,25 +215,6 @@ end
 --==============================================================================
 -- Paste Helpers BEGIN
 --==============================================================================
-
-local function pathJoin(...)
-	-- Detect OS path separator ('\' for Windows, '/' for Unix)
-	local separator = package.config:sub(1, 1)
-	local parts = { ... }
-	local filteredParts = {}
-	-- Remove empty strings or nil values
-	for _, part in ipairs(parts) do
-		if part and part ~= "" then
-			table.insert(filteredParts, part)
-		end
-	end
-	-- Join the remaining parts with the separator
-	local path = table.concat(filteredParts, separator)
-	-- Normalize any double separators (e.g., "folder//file" → "folder/file")
-	path = path:gsub(separator .. "+", separator)
-
-	return path
-end
 
 local get_cwd = ya.sync(function()
 	return tostring(cx.active.current.cwd)
@@ -332,146 +232,122 @@ end)
 -- Paste Images BEGIN
 --==============================================================================
 
--- Get all available image formats from clipboard
-local function get_clipboard_image_targets()
-	-- Try macOS first
-	local handle = io.popen("osascript -e 'return (clipboard info) as string' 2>/dev/null")
-	if handle then
-		local info = handle:read("*a")
-		handle:close()
+local MAC_TYPES = [[
+ObjC.import('AppKit');
+function run() {
+    var pb = $.NSPasteboard.generalPasteboard;
+    var types = pb.types;
+    if (!types) return '';
+    var result = [];
+    if (types.containsObject('public.file-url') || types.containsObject('NSFilenamesPboardType'))
+        result.push('text/uri-list');
+    if (types.containsObject('public.png') || types.containsObject('public.tiff') ||
+        types.containsObject('public.jpeg') || types.containsObject('com.compuserve.gif') ||
+        types.containsObject('Apple PNG pasteboard type') || types.containsObject('NeXT TIFF v4.0 pasteboard type'))
+        result.push('image/png');
+    if (types.containsObject('public.utf8-plain-text') || types.containsObject('public.utf16-plain-text') ||
+        types.containsObject('public.utf16-external-plain-text') || types.containsObject('NSStringPboardType'))
+        result.push('text/plain');
+    return result.join('\n');
+}
+]]
 
-		if info and info:match("picture") then
-			-- macOS has image in clipboard, return a generic image target
-			-- We'll detect the actual format when getting the data
-			return "image/png image/jpeg image/tiff image/gif"
-		end
+local function mime_lines(content)
+	local result = {}
+	for line in (content or ""):gmatch("[^\r\n]+") do
+		result[#result + 1] = line
 	end
-
-	-- Try Linux clipboard tools
-	handle = io.popen("xclip -selection clipboard -o -t TARGETS 2>/dev/null || wl-paste --list-types 2>/dev/null")
-	if not handle then
-		return nil
-	end
-
-	local targets = handle:read("*a")
-	handle:close()
-
-	if targets and targets:match("image/") then
-		return targets
-	end
-
-	return nil
+	return #result > 0 and result or nil
 end
 
--- Detect best image format from clipboard (with priority)
-local function get_best_image_format(targets)
-	if not targets then
-		return nil
+local function get_clipboard_mimetypes()
+	local types = mime_lines(command_output("osascript", { "-l", "JavaScript", "-e", MAC_TYPES }))
+	if types then
+		return types, "mac"
 	end
-
-	-- svg differs from pattern image/jpeg -> .jpeg
-	if targets:match("image/svg%+xml") then
-		return "svg"
-		-- common pattern image/jpeg -> .jpeg
-	elseif targets:match("image/") then
-		local format = targets:match("image/([%w-]+)")
-		if format then
-			return format
+	for _, backend in ipairs(linux_backends()) do
+		local content
+		if backend == "wayland" then
+			content = command_output("wl-paste", { "--list-types" })
 		else
-			-- fallback to png
-			warn("Could not determine image format!")
-			return "png"
+			content = command_output("xclip", { "-selection", "clipboard", "-o", "-t", "TARGETS" })
+		end
+		types = mime_lines(content)
+		if types then
+			return types, backend
 		end
 	end
-
-	-- For macOS, if we detect an image but can't determine format, default to png
-	if targets:match("image/png image/jpeg image/tiff image/gif") then
-		return "png"
-	end
-
-	return nil
 end
 
--- Get image data from clipboard
-local function get_clipboard_image_data(format)
-	local mime_type = "image/" .. format
-	if format == "svg" then
-		mime_type = "image/svg+xml"
+local function read_clipboard(mime, backend)
+	if backend == "wayland" then
+		return command_output("wl-paste", { "--no-newline", "--type", mime })
+	elseif backend == "x11" then
+		return command_output("xclip", { "-selection", "clipboard", "-o", "-t", mime })
+	elseif backend == "mac" and mime == "text/plain" then
+		return command_output("pbpaste", {})
 	end
-
-	-- Try macOS clipboard first
-	local handle = io.popen("osascript -e 'return (clipboard info) as string' 2>/dev/null")
-	if handle then
-		local info = handle:read("*a")
-		handle:close()
-
-		if info and info:match("picture") then
-			-- macOS has image in clipboard, save it to a temporary file and read it
-			local temp_file = "/tmp/yazi_clipboard_image." .. format
-			local save_cmd = string.format(
-				"osascript -e 'set the clipboard to (read (POSIX file \"%s\") as «class PNGf»)' 2>/dev/null || osascript -e 'set the clipboard to (read (POSIX file \"%s\") as «class JPEG»)' 2>/dev/null",
-				temp_file,
-				temp_file
-			)
-
-			-- First, try to get the image data using pbpaste with different formats
-			local pbpaste_cmd =
-				"pbpaste -Prefer png 2>/dev/null || pbpaste -Prefer jpeg 2>/dev/null || pbpaste 2>/dev/null"
-			handle = io.popen(pbpaste_cmd)
-			if handle then
-				local data = handle:read("*a")
-				handle:close()
-				if data and #data > 0 then
-					return data
-				end
-			end
-		end
-	end
-
-	-- Try X11 clipboard (xclip)
-	handle = io.popen(string.format("xclip -selection clipboard -o -t %s 2>/dev/null", mime_type))
-	if handle then
-		local data = handle:read("*a")
-		handle:close()
-		if data and #data > 0 then
-			return data
-		end
-	end
-
-	-- Try Wayland clipboard (wl-paste)
-	handle = io.popen(string.format("wl-paste -t %s 2>/dev/null", mime_type))
-	if handle then
-		local data = handle:read("*a")
-		handle:close()
-		if data and #data > 0 then
-			return data
-		end
-	end
-
-	return nil
 end
 
--- Handle image paste (image/ mimetype)
-function M:handle_image_paste(image_targets, no_hover, show_notify)
-	-- Get best format as suggestion
-	local suggested_format = get_best_image_format(image_targets)
-	if not suggested_format then
-		ya.err("Could not determine image format!")
+local MAC_IMAGE = [[
+ObjC.import('AppKit');
+function run(argv) {
+    var pb = $.NSPasteboard.generalPasteboard;
+    var images = pb.readObjectsForClassesOptions([$.NSImage], {});
+    if (!images || images.count < 1) throw new Error('No clipboard image');
+    var rep = $.NSBitmapImageRep.imageRepWithData(images.objectAtIndex(0).TIFFRepresentation);
+    if (!rep) throw new Error('Cannot decode clipboard image');
+    var data = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, {});
+    if (!data || !data.writeToFileAtomically(argv[0], true))
+        throw new Error('Cannot write clipboard image');
+}
+]]
+
+local function get_clipboard_image_data(format, backend)
+	if backend ~= "mac" then
+		return read_clipboard(format == "svg" and "image/svg+xml" or ("image/" .. format), backend)
+	end
+	local temp_dir = os.getenv("TMPDIR") or "/tmp"
+	local output = command_output("mktemp", { "-d", temp_dir .. "/ucp-clipboard.XXXXXX" })
+	if not output or output:sub(-1) ~= "\n" then
+		warn("Could not create a private clipboard image directory")
 		return
 	end
+	-- mktemp prints one protocol newline; embedded pathname newlines are data.
+	local temp_root = output:sub(1, -2)
+	local temp_file = temp_root .. "/image.png"
+	local status = Command("osascript"):arg({ "-l", "JavaScript", "-e", MAC_IMAGE, temp_file }):status()
+	local data
+	if status and status.success then
+		local file = io.open(temp_file, "rb")
+		if file then
+			data = file:read("*a")
+			file:close()
+		end
+	end
+	local removed, err = fs.remove("dir_all", Url(temp_root))
+	if not removed then
+		warn("Could not remove temporary clipboard image directory: %s", tostring(err))
+	end
+	return data
+end
 
-	-- Generate a default filename with beautiful timestamp
-	local timestamp = os.date("%Y-%m-%d_%H-%M-%S")
-	local file_name = string.format("pasted_%s.%s", timestamp, suggested_format)
-
-	-- Get the image data from clipboard using the detected format
-	local clipboard_content = get_clipboard_image_data(suggested_format)
-	if not clipboard_content or #clipboard_content == 0 then
-		ya.err("Failed to get image data from clipboard!")
+function M:handle_image_paste(image_targets, no_hover, show_notify, backend)
+	local format = image_targets:match("image/svg%+xml") and "svg" or image_targets:match("image/([%w-]+)")
+	if backend == "mac" then
+		format = "png"
+	end
+	if not format then
+		warn("Could not determine clipboard image format")
 		return
 	end
-
-	M:save_file_with_conflict_handling(file_name, clipboard_content, no_hover, show_notify)
+	local data = get_clipboard_image_data(format, backend)
+	if not data or #data == 0 then
+		warn("Failed to get image data from clipboard")
+		return
+	end
+	local file_name = string.format("pasted_%s.%s", os.date("%Y-%m-%d_%H-%M-%S"), format)
+	return M:save_file_with_conflict_handling(file_name, data, no_hover, show_notify)
 end
 
 --==============================================================================
@@ -481,595 +357,592 @@ end
 --==============================================================================
 -- Paste List BEGIN
 --==============================================================================
-local function escape_lua_pattern(s)
-	return s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
-end
 
--- handle code/file-list clipboard mimetype
-local function handle_code_file_list_paste(content)
-	ya.dbg("Found code/file-list target, attempting to read...")
-	-- Try code/file-list format (VS Code and other editors)
-	local code_handle = io.popen("xclip -selection clipboard -o -t code/file-list 2>/dev/null")
-	if code_handle then
-		local code_content = code_handle:read("*a")
-		code_handle:close()
+local MAC_FILES = [[
+ObjC.import('AppKit');
+function run() {
+    var pb = $.NSPasteboard.generalPasteboard;
+    var options = {};
+    options[ObjC.unwrap($.NSPasteboardURLReadingFileURLsOnlyKey)] = true;
+    var urls = pb.readObjectsForClassesOptions([$.NSURL], options);
+    var result = [];
+    if (urls) {
+        for (var i = 0; i < urls.count; i++)
+            result.push(ObjC.unwrap(urls.objectAtIndex(i).absoluteString));
+    }
+    if (!result.length) {
+        var paths = pb.propertyListForType('NSFilenamesPboardType');
+        if (paths) {
+            for (var j = 0; j < paths.count; j++)
+                result.push(ObjC.unwrap($.NSURL.fileURLWithPath(paths.objectAtIndex(j)).absoluteString));
+        }
+    }
+    return result.join('\n');
+}
+]]
 
-		ya.dbg("code/file-list content: %s", code_content or "empty")
-
-		local file_paths = {}
-		for file_path in code_content:gmatch("[^\r\n]+") do
-			-- Handle file:// URIs
-			if file_path:match("^file://") then
-				-- Extract path from file:// URI and URL decode
-				local path = file_path:gsub("^file://", "")
-				path = path:gsub("%%(%x%x)", function(hex)
-					return string.char(tonumber(hex, 16))
-				end)
-				table.insert(file_paths, path)
-				-- Handle direct paths
-			elseif file_path:match("^/") or file_path:match("^%.%/") then
-				table.insert(file_paths, file_path)
-			end
-		end
-		if #file_paths > 0 then
-			ya.dbg("Found %d file paths in code/file-list", #file_paths)
-			return file_paths
-		end
-	end
-end
-
-local function handle_text_uri_list_paste(content)
-	ya.dbg("Found text/uri-list target as fallback, attempting to read...")
-	local uri_handle = io.popen(
-		"xclip -selection clipboard -o -t text/uri-list 2>/dev/null || wl-paste -t text/uri-list 2>/dev/null")
-	if uri_handle then
-		local uri_content = uri_handle:read("*a")
-		uri_handle:close()
-
-		ya.dbg("text/uri-list content:", uri_content or "empty")
-
-		local file_paths = {}
-		for file_path in uri_content:gmatch("file://([^\r\n]+)") do
-			-- URL decode the path
-			local decoded_path = file_path:gsub("%%(%x%x)", function(hex)
+local function decode_file_urls(content)
+	local paths = {}
+	-- Split the encoded representation, never decoded POSIX paths.
+	for line in (content or ""):gmatch("[^\r\n]+") do
+		local host, path = line:match("^file://([^/]*)(/.*)$")
+		if path and (host == "" or host == "localhost") then
+			path = path:gsub("%%(%x%x)", function(hex)
 				return string.char(tonumber(hex, 16))
 			end)
-			table.insert(file_paths, decoded_path)
+			if not path:find("\0", 1, true) then
+				paths[#paths + 1] = path
+			end
 		end
-		if #file_paths > 0 then
-			ya.dbg("Found file paths in text/uri-list", #file_paths)
-			return file_paths
+	end
+	return #paths > 0 and paths or nil
+end
+
+local function get_clipboard_file_uris(mimetypes, backend)
+	if backend == "mac" then
+		return decode_file_urls(command_output("osascript", { "-l", "JavaScript", "-e", MAC_FILES }))
+	end
+	for _, mime in ipairs({ "code/file-list", "text/uri-list" }) do
+		for _, available in ipairs(mimetypes) do
+			if available == mime then
+				local paths = decode_file_urls(read_clipboard(mime, backend))
+				if paths then
+					return paths
+				end
+			end
 		end
 	end
 end
 
--- Detect if clipboard contains file URIs and extract all paths
-local function get_clipboard_file_uris()
-	-- Try macOS pbpaste first
-	local handle = io.popen("pbpaste 2>/dev/null")
-	if handle then
-		local content = handle:read("*a")
-		handle:close()
+-- Filesystem transfers use structured lstat snapshots, never shell traversal.
+local function get_filename_from_path(path)
+	return path:gsub("/+$", ""):match("[^/]+$")
+end
 
-		if content and content:match("^/") then
-			-- macOS pbpaste returns file paths directly when files are copied
-			local file_paths = {}
-			for file_path in content:gmatch("[^\r\n]+") do
-				-- Only include absolute paths (starting with /)
-				if file_path:match("^/") then
-					table.insert(file_paths, file_path)
-				end
+local function transfer_stat(url)
+	local cha, err = fs.cha(url, false)
+	if cha or (err and err.kind == "NotFound") then
+		return cha
+	end
+	return nil, string.format("Cannot inspect %s: %s", tostring(url), tostring(err))
+end
+
+local function absolute_path(path)
+	if type(path) ~= "string" or path:sub(1, 1) ~= "/" or path:find("\0", 1, true) then
+		return nil, "Expected an absolute local path without NUL bytes"
+	end
+	for part in path:gmatch("[^/]+") do
+		if part == "." or part == ".." then
+			return nil, "Dot path components are not allowed"
+		end
+	end
+	-- Trailing slashes must not turn lstat of a directory link into stat.
+	return path == "/" and path or path:gsub("/+$", "")
+end
+
+local function canonical_path(url)
+	local out = command_output("realpath", { tostring(url) })
+	if not out or out:sub(-1) ~= "\n" then
+		return nil, "Cannot canonicalize " .. tostring(url)
+	end
+	-- Remove one protocol newline, not whitespace belonging to the filename.
+	out = out:sub(1, -2)
+	if out:sub(1, 1) ~= "/" then
+		return nil, "Invalid canonical path for " .. tostring(url)
+	end
+	return out
+end
+
+local function path_contains(a, b)
+	return a == b or (a == "/" and b:sub(1, 1) == "/") or b:sub(1, #a + 1) == a .. "/"
+end
+
+-- Missing components are permitted for text filenames, but neither links
+-- nor stat errors are. Check the root and all existing intermediate nodes.
+local function destination_safe(url)
+	local current = url
+	while current do
+		local cha, err = transfer_stat(current)
+		if err then
+			return false, err
+		elseif cha and cha.is_link then
+			return false, "Destination contains a symlink: " .. tostring(current)
+		elseif current ~= url and cha and not cha.is_dir then
+			return false, "Destination parent is not a directory: " .. tostring(current)
+		end
+		current = current.parent
+	end
+	return true
+end
+
+local function destination_cwd()
+	local chosen = Url(get_cwd())
+	local cha, err = transfer_stat(chosen)
+	if not cha or cha.is_link or not cha.is_dir then
+		return nil, err or ("Destination root must be a real directory: " .. tostring(chosen))
+	end
+	-- Resolve aliases above the chosen directory (e.g. macOS /var), not links
+	-- encountered inside the destination tree.
+	local physical, canonical_err = canonical_path(chosen)
+	if not physical then
+		return nil, canonical_err
+	end
+	local cwd = Url(physical)
+	local safe, safe_err = destination_safe(cwd)
+	if not safe then
+		return nil, safe_err
+	end
+	return cwd
+end
+
+-- Missing or dangling-link leaves use their canonical existing parent.
+-- No failed canonicalization is replaced by an unchecked raw path.
+local function canonical_leaf(url, cha)
+	if cha and not cha.is_link then
+		return canonical_path(url)
+	end
+	local suffix, current = {}, url
+	while current do
+		local info, err = transfer_stat(current)
+		if err then
+			return nil, err
+		end
+		if info and not (current == url and info.is_link) then
+			local base, cerr = canonical_path(current)
+			if not base then
+				return nil, cerr
 			end
-			if #file_paths > 0 then
-				return file_paths
+			for i = #suffix, 1, -1 do
+				base = (base == "/" and "" or base) .. "/" .. suffix[i]
+			end
+			return base
+		end
+		if not current.name then
+			break
+		end
+		suffix[#suffix + 1] = current.name
+		current = current.parent
+	end
+	return nil, "Cannot canonicalize " .. tostring(url)
+end
+
+local function transfer_overlap(source, source_cha, target, target_cha)
+	local src, err = canonical_leaf(source, source_cha)
+	if not src then
+		return false, err
+	end
+	local dst, derr = canonical_leaf(target, target_cha)
+	if not dst then
+		return false, derr
+	end
+	if path_contains(src, dst) or path_contains(dst, src) then
+		return false, "Source and destination overlap: " .. tostring(target)
+	end
+	-- Also detect resolvable source-link aliases without traversing them
+	-- during copying or requiring realpath of dangling links.
+	if source_cha.is_link then
+		local followed, follow_err = fs.cha(source, true)
+		local dangling = follow_err
+			and (follow_err.kind == "NotFound" or follow_err.kind == "NotADirectory")
+		if not followed and not dangling then
+			return false, "Cannot inspect source-link alias: " .. tostring(follow_err)
+		elseif followed then
+			local resolved, rerr = canonical_path(source)
+			if not resolved then
+				return false, rerr
+			end
+			if path_contains(resolved, dst) or path_contains(dst, resolved) then
+				return false, "Source and destination overlap through a link: " .. tostring(target)
 			end
 		end
 	end
+	return true
+end
 
-	-- Try to get file URI from clipboard (common in Linux file managers)
-	handle = io.popen("xclip -selection clipboard -o -t TARGETS 2>/dev/null || wl-paste --list-types 2>/dev/null")
-	if not handle then
+local function transfer_kind(cha)
+	if cha.is_link then
+		return "link"
+	elseif cha.is_dir then
+		return "dir"
+	elseif cha.is_block or cha.is_char or cha.is_fifo or cha.is_sock or cha.is_dummy then
 		return nil
 	end
-
-	local targets = handle:read("*a")
-	handle:close()
-
-	-- Check for code/file-list target specifically
-	if targets and targets:match("code/file%-list") then
-		return handle_code_file_list_paste(targets)
-		-- Check for text/uri-list
-	elseif targets and targets:match("text/uri%-list") then
-		return handle_text_uri_list_paste(targets)
-	end
-
-	return nil
+	return "file"
 end
 
--- Extract filename from a full path
-local function get_filename_from_path(path)
-	-- Remove trailing slashes
-	path = path:gsub("/$", "")
-	-- Extract filename (everything after the last separator)
-	local separator = package.config:sub(1, 1)
-	local filename = path:match("[^" .. separator .. "]+$")
-	return filename or path
+-- Preserve rwx bits so a staged swap never widens private data.
+local function transfer_mode(cha)
+	local perm = cha:perm()
+	if type(perm) ~= "string" or #perm < 10 then
+		return cha.is_dir and "0700" or "0600"
+	end
+	local digits = {}
+	for group = 0, 2 do
+		local offset, digit = 2 + group * 3, 0
+		if perm:sub(offset, offset) == "r" then
+			digit = digit + 4
+		end
+		if perm:sub(offset + 1, offset + 1) == "w" then
+			digit = digit + 2
+		end
+		local exec = perm:sub(offset + 2, offset + 2)
+		if exec == "x" or exec == "s" or exec == "t" then
+			digit = digit + 1
+		end
+		digits[#digits + 1] = tostring(digit)
+	end
+	return "0" .. table.concat(digits)
 end
 
--- Recursively copy a directory and all its contents
-local function copy_directory(source_dir, target_dir, no_hover)
-	-- Create target directory
-	if target_dir.parent then
-		fs.create("dir_all", target_dir.parent)
+local function transfer_chmod(url, mode)
+	if command_output("chmod", { mode, tostring(url) }) == nil then
+		return false, "Cannot set permissions on " .. tostring(url)
 	end
-	fs.create("dir", target_dir)
+	return true
+end
 
-	local source_dir_escaped = tostring(source_dir):gsub("'", "'\\''")
-	local source_files = io.popen("find '" .. source_dir_escaped .. "' -type f 2>/dev/null")
-	if not source_files then
-		return false
+local function snapshot_tree(url, cha)
+	local kind = transfer_kind(cha)
+	if not kind then
+		return nil, "Unsupported source type: " .. tostring(url)
 	end
-
-	local success = true
-	for line in source_files:lines() do
-		-- Get relative path from source directory
-		local rel_path = line:gsub("^" .. escape_lua_pattern(tostring(source_dir)) .. "/", "")
-		local target_file_path = Url(pathJoin(tostring(target_dir), rel_path))
-
-		-- Read source file content
-		local source_content_file = io.open(line, "rb")
-		if source_content_file then
-			local content = source_content_file:read("*a")
-			source_content_file:close()
-
-			-- Ensure parent directories exist
-			if target_file_path.parent then
-				fs.create("dir_all", target_file_path.parent)
+	local node = { url = url, kind = kind, mode = transfer_mode(cha) }
+	if kind == "dir" then
+		node.children = {}
+		local files, err = fs.read_dir(url, { resolve = false })
+		if not files then
+			return nil, string.format("Cannot read directory %s: %s", tostring(url), tostring(err))
+		end
+		for _, file in ipairs(files) do
+			local name = file.url.name
+			if not name or name == "." or name == ".." or name:find("/", 1, true) then
+				return nil, "Invalid directory entry in " .. tostring(url)
 			end
-
-			-- Write the file
-			local wrote = fs.write(target_file_path, content)
-			if not wrote then
-				success = false
+			local child_cha, stat_err = transfer_stat(file.url)
+			if not child_cha then
+				return nil, stat_err or ("Source disappeared: " .. tostring(file.url))
 			end
-		else
-			success = false
+			local child, cerr = snapshot_tree(file.url, child_cha)
+			if not child then
+				return nil, cerr
+			end
+			node.children[name] = child
 		end
 	end
-	source_files:close()
-
-	if success and not no_hover then
-		ya.emit("reveal", { tostring(target_dir), tab = get_current_tab_id(), no_dummy = true, raw = true })
-	end
-
-	return success
+	return node
 end
 
--- Check if a path is a directory
-local function is_directory(path)
-	local path_escaped = tostring(path):gsub("'", "'\\''")
-	local check = io.popen("test -d '" .. path_escaped .. "' && echo dir || echo file 2>/dev/null")
-	if check then
-		local result = check:read("*a")
-		check:close()
-		return result:match("dir")
-	end
-	return false
-end
-
--- Check if two paths resolve to the same location (handles symlinks and relative paths)
-local function paths_resolve_to_same(source_path, target_path)
-	local source_str = tostring(source_path):gsub("'", "'\\''")
-	local target_str = tostring(target_path):gsub("'", "'\\''")
-
-	-- Use realpath to resolve both paths to their absolute, canonical forms
-	local cmd = string.format("realpath '%s' 2>/dev/null", source_str)
-	local source_handle = io.popen(cmd)
-	local resolved_source = nil
-	if source_handle then
-		resolved_source = source_handle:read("*a"):gsub("%s+$", "") -- trim whitespace
-		source_handle:close()
-	end
-
-	cmd = string.format("realpath '%s' 2>/dev/null", target_str)
-	local target_handle = io.popen(cmd)
-	local resolved_target = nil
-	if target_handle then
-		resolved_target = target_handle:read("*a"):gsub("%s+$", "") -- trim whitespace
-		target_handle:close()
-	end
-
-	-- Compare resolved paths if both resolved successfully
-	if resolved_source and resolved_target then
-		return resolved_source == resolved_target
-	end
-
-	-- Fallback: simple string comparison if realpath failed
-	return tostring(source_path) == tostring(target_path)
-end
-
--- Handle directory collision by placing file inside directory and overwriting matching contents
-local function handle_directory_collision(dir_path, source_file_uri, source_file_content, no_hover)
-	local source_filename = get_filename_from_path(source_file_uri)
-	-- Place the file inside the directory
-	local target_file = Url(pathJoin(tostring(dir_path), source_filename))
-
-	-- Check if target file exists in the directory
-	local exists, _ = fs.cha(target_file)
-	if exists then
-		-- Try to remove it (could be file or subdirectory)
-		local removed, err = fs.remove("file", target_file)
-		if not removed and err and tostring(err):match("Is a directory") then
-			-- Target is also a directory, recursively overwrite contents
-			-- Check if source is also a directory
-			local source_uri_esc = tostring(source_file_uri):gsub("'", "'\\''")
-			local source_dir_check = io.popen("test -d '" .. source_uri_esc .. "' && echo dir || echo file 2>/dev/null")
-			if source_dir_check then
-				local result = source_dir_check:read("*a")
-				source_dir_check:close()
-
-				if result:match("dir") then
-					-- Both are directories, recursively overwrite contents
-					local source_files = io.popen("find '" .. source_uri_esc .. "' -type f 2>/dev/null")
-					if source_files then
-						local success = true
-						for line in source_files:lines() do
-							-- Get relative path from source directory
-							local rel_path = line:gsub("^" .. escape_lua_pattern(source_file_uri) .. "/", "")
-							local target_file_path = Url(pathJoin(tostring(target_file), rel_path))
-
-							-- Read source file content
-							local source_content_file = io.open(line, "rb")
-							if source_content_file then
-								local content = source_content_file:read("*a")
-								source_content_file:close()
-
-								-- Remove existing file if it exists
-								local exists_file, _ = fs.cha(target_file_path)
-								if exists_file then
-									fs.remove("file", target_file_path)
-								end
-
-								-- Ensure parent directories exist
-								if target_file_path.parent then
-									fs.create("dir_all", target_file_path.parent)
-								end
-
-								-- Write the file
-								fs.write(target_file_path, content)
-							else
-								success = false
-							end
-						end
-						source_files:close()
-						if success and not no_hover then
-							ya.emit(
-								"reveal",
-								{ tostring(target_file), tab = get_current_tab_id(), no_dummy = true, raw = true }
-							)
-						end
-						return success
-					end
-				end
+-- Only writes into private staging. Links are leaves, including dangling
+-- links; fs.copy never writes onto a preexisting user path.
+local function stage_tree(node, destination)
+	if node.kind == "dir" then
+		local ok, err = fs.create("dir", destination)
+		if not ok then
+			return false, tostring(err)
+		end
+		for name, child in pairs(node.children) do
+			local copied, cerr = stage_tree(child, destination:join(name))
+			if not copied then
+				return false, cerr
 			end
-			-- If source is a file trying to overwrite a directory, put file inside the directory
-			if target_file.parent then
-				fs.create("dir_all", target_file.parent)
-			end
-			fs.write(target_file, source_file_content)
-			if not no_hover then
-				ya.emit("reveal", { tostring(target_file), tab = get_current_tab_id(), no_dummy = true, raw = true })
-			end
-			return true
-		elseif removed then
-			-- Was a file, now removed, write the new file
-			if target_file.parent then
-				fs.create("dir_all", target_file.parent)
-			end
-			fs.write(target_file, source_file_content)
-			if not no_hover then
-				ya.emit("reveal", { tostring(target_file), tab = get_current_tab_id(), no_dummy = true, raw = true })
-			end
-			return true
-		else
-			return false
+		end
+		return transfer_chmod(destination, node.mode)
+	elseif node.kind == "link" then
+		if command_output("cp", { "-P", "--", tostring(node.url), tostring(destination) }) == nil then
+			return false, "Cannot copy source link: " .. tostring(node.url)
+		end
+		return true
+	elseif node.kind == "data" then
+		local ok, err = fs.write(destination, node.data)
+		if not ok then
+			return false, tostring(err)
 		end
 	else
-		-- File doesn't exist in directory, just create it
-		if target_file.parent then
-			fs.create("dir_all", target_file.parent)
+		local len, err = fs.copy(node.url, destination)
+		if len == nil then
+			return false, string.format("Cannot copy %s: %s", tostring(node.url), tostring(err))
 		end
-		fs.write(target_file, source_file_content)
-		if not no_hover then
-			ya.emit("reveal", { tostring(target_file), tab = get_current_tab_id(), no_dummy = true, raw = true })
+	end
+	return transfer_chmod(destination, node.mode)
+end
+
+-- Merge is a tree plan, not in-place mutation. Reject incoming collisions
+-- with destination links; preserve unrelated links in the staged result.
+local function merge_child(parent, name, incoming)
+	local existing = parent.children[name]
+	if existing and existing.kind == "link" then
+		return false, "Destination collision is a symlink: " .. tostring(existing.url)
+	elseif existing and existing.kind == "dir" then
+		if incoming.kind == "dir" then
+			for child_name, child in pairs(incoming.children) do
+				local ok, err = merge_child(existing, child_name, child)
+				if not ok then
+					return false, err
+				end
+			end
+			return true
+		end
+		return merge_child(existing, name, incoming)
+	end
+	parent.children[name] = incoming
+	return true
+end
+
+local function copy_destination(target, kind)
+	local name, extension = target.name, ""
+	if kind ~= "dir" then
+		local stem, ext = name:match("^(.+)(%.[^.]*)$")
+		if stem then
+			name, extension = stem, ext
+		end
+	end
+	local index = 0
+	while true do
+		local suffix = index == 0 and "" or ("_" .. index)
+		local candidate = target.parent:join(name .. "_copy" .. suffix .. extension)
+		local cha, err = transfer_stat(candidate)
+		if err then
+			return nil, err
+		elseif not cha then
+			return candidate
+		end
+		index = index + 1
+	end
+end
+
+local function cleanup_stage(stage)
+	-- Read-only directory modes belong on installed trees, not discarded
+	-- private copies/backups. Unlock only real directories inside staging;
+	-- never chmod or traverse preserved source links or restored targets.
+	local function unlock(url)
+		local cha, stat_err = transfer_stat(url)
+		if not cha then
+			return false, stat_err or ("Missing staging entry: " .. tostring(url))
+		elseif cha.is_link or not cha.is_dir then
+			return true
+		end
+		local secured, secure_err = transfer_chmod(url, "0700")
+		if not secured then
+			return false, secure_err
+		end
+		local files, read_err = fs.read_dir(url, { resolve = false })
+		if not files then
+			return false, tostring(read_err)
+		end
+		for _, file in ipairs(files) do
+			local ok, err = unlock(file.url)
+			if not ok then
+				return false, err
+			end
 		end
 		return true
 	end
+	local unlocked, unlock_err = unlock(stage)
+	if not unlocked then
+		warn("Cannot clean private staging directory %s: %s", tostring(stage), tostring(unlock_err))
+		return
+	end
+	local ok, err = fs.remove("dir_all", stage)
+	if not ok then
+		warn("Cannot clean private staging directory %s: %s", tostring(stage), tostring(err))
+	end
 end
 
--- Handle file list paste (code/file-list mimetype)
-function M:handle_file_list_paste(file_uris, no_hover, show_notify)
-	ya.dbg("file_uris: ", table.concat(file_uris, ", "))
-
-	local success_count = 0
-
-	local bulk_action = nil -- nil, "overwrite_all", "copy_all", "cancel_all"
-
-	for i, file_uri in ipairs(file_uris) do
-		-- Extract filename from the URI path
-		local file_name = get_filename_from_path(file_uri)
-
-		-- Check if source is a directory
-		local is_dir = is_directory(file_uri)
-
-		if is_dir then
-			-- Handle directory copy
-			local dir_path = Url(pathJoin(get_cwd(), file_name))
-			local cha, _ = fs.cha(dir_path)
-			if cha then
-				-- Directory exists, ask user what to do (unless bulk action is set)
-				local action = nil
-
-				if bulk_action == "cancel_all" then
-					-- Skip all remaining files
-					break
-				elseif bulk_action == "overwrite_all" then
-					action = 1 -- Overwrite
-				elseif bulk_action == "copy_all" then
-					action = 2 -- Create copy
-				else
-					-- Show bottom menu with directory info
-					action = ya.which({
-						cands = {
-							{ desc = string.format("Directory: %s", file_name), on = "|" },
-							{ desc = string.format("Progress: %d/%d", i, #file_uris), on = "|" },
-							{ desc = "", on = "|" },
-							{ desc = "Overwrite", on = "o" },
-							{ desc = "Merge contents", on = "m" },
-							{ desc = "Create copy (_copy)", on = "c" },
-							{ desc = "Skip directory", on = "q" },
-							{ desc = "Overwrite All", on = "O" },
-							{ desc = "Create copy All", on = "C" },
-							{ desc = "Cancel All", on = "Q" },
-						},
-					})
-
-					-- Adjust action index since first three items are info only
-					if action and action > 3 then
-						action = action - 3
-					elseif action and action <= 3 then
-						action = nil
-					end
-
-					-- Set bulk actions is selected
-					if action == 4 then
-						bulk_action = "overwrite_all"
-						action = 1
-					elseif action == 5 then
-						bulk_action = "copy_all"
-						action = 2
-					elseif action == 6 then
-						bulk_action = "cancel_all"
-						break
-					end
-				end
-
-				if action == 1 then -- Overwrite
-					-- Check if source and destination are the same directory
-					if paths_resolve_to_same(file_uri, dir_path) then
-						warn("Source and destination are the same", tostring(dir_path))
-						-- Skip this directory, continue with next item
-					else
-						-- Remove existing directory recursively using system command
-						local dir_path_str = tostring(dir_path):gsub("'", "'\\''")
-						local remove_cmd = io.popen("rm -rf '" .. dir_path_str .. "' 2>&1")
-						if remove_cmd then
-							local err_output = remove_cmd:read("*a")
-							remove_cmd:close()
-							-- If removal succeeded or directory didn't exist, proceed with copy
-							if err_output == "" or err_output:match("No such file") then
-								-- Copy the directory
-								if copy_directory(file_uri, dir_path, no_hover) then
-									success_count = success_count + 1
-								else
-									warn("Failed to overwrite directory: %s", tostring(dir_path))
-								end
-							else
-								warn(
-									"Failed to remove existing directory: %s (err: %s)",
-									tostring(dir_path),
-									err_output
-								)
-							end
-						else
-							-- Try fs.remove as fallback
-							local removed, err = fs.remove("dir", dir_path)
-							if removed or (err and tostring(err):match("Is a directory")) then
-								if copy_directory(file_uri, dir_path, no_hover) then
-									success_count = success_count + 1
-								else
-									warn("Failed to overwrite directory: %s", tostring(dir_path))
-								end
-							else
-								warn(
-									"Failed to remove existing directory: %s (err: %s)",
-									tostring(dir_path),
-									tostring(err)
-								)
-							end
-						end
-					end
-				elseif action == 2 then -- Merge
-					-- Simply copy into existing directory without deleting it
-					if copy_directory(file_uri, dir_path, no_hover) then
-						success_count = success_count + 1
-					else
-						warn("Failed to merge directory: %s", tostring(dir_path))
-					end
-				elseif action == 3 then -- Create copy
-					-- Generate copy directory name with _copy suffix
-					local copy_name = file_name .. "_copy"
-					local copy_path = Url(pathJoin(get_cwd(), copy_name))
-
-					if copy_directory(file_uri, copy_path, no_hover) then
-						success_count = success_count + 1
-					else
-						warn("Failed to copy directory: %s", tostring(copy_path))
-					end
-				end
-				-- If action == 3 (Cancel) or nil, do nothing
-			else
-				-- Directory doesn't exist, just copy it
-				if copy_directory(file_uri, dir_path, no_hover) then
-					success_count = success_count + 1
-				else
-					warn("Failed to copy directory: %s", file_uri)
-				end
+-- Stage completely before mutation. Reserve fresh destinations exclusively;
+-- keep existing targets in a private backup until the final rename succeeds.
+-- A failed rollback deliberately retains the recovery directory.
+local function install_tree(tree, target, old_cha)
+	local stage, err = fs.unique("dir", target.parent:join(".ucp-stage"))
+	if not stage then
+		return nil, tostring(err)
+	end
+	local secured, serr = transfer_chmod(stage, "0700")
+	if not secured then
+		cleanup_stage(stage)
+		return nil, serr
+	end
+	local payload, backup = stage:join("payload"), stage:join("backup")
+	local ready, rerr = stage_tree(tree, payload)
+	if not ready then
+		cleanup_stage(stage)
+		return nil, rerr
+	end
+	local safe, safe_err = destination_safe(old_cha and target or target.parent)
+	if not safe then
+		cleanup_stage(stage)
+		return nil, safe_err
+	end
+	local reserved
+	if old_cha then
+		local moved, merr = fs.rename(target, backup)
+		if not moved then
+			cleanup_stage(stage)
+			return nil, "Cannot back up destination: " .. tostring(merr)
+		end
+	else
+		reserved, err = fs.unique(tree.kind == "dir" and "dir" or "file", target)
+		if not reserved then
+			cleanup_stage(stage)
+			return nil, "Cannot reserve unused destination: " .. tostring(err)
+		end
+		target = reserved
+	end
+	local installed, ierr = fs.rename(payload, target)
+	if not installed then
+		if old_cha then
+			local restored, restore_err = fs.rename(backup, target)
+			if not restored then
+				return nil, string.format(
+					"Install failed (%s); rollback failed (%s). Original target retained at %s",
+					tostring(ierr), tostring(restore_err), tostring(backup)
+				)
 			end
 		else
-			-- Handle file copy
-			local source_file = io.open(file_uri, "rb")
-			if source_file then
-				local file_content = source_file:read("*a")
-				source_file:close()
-
-				-- Save the file
-				local file_path = Url(pathJoin(get_cwd(), file_name))
-				local cha, _ = fs.cha(file_path)
-				if cha then
-					-- File exists, ask user what to do (unless bulk action is set)
-					local action = nil
-
-					if bulk_action == "cancel_all" then
-						-- Skip all remaining files
-						break
-					elseif bulk_action == "overwrite_all" then
-						action = 1 -- Overwrite
-					elseif bulk_action == "copy_all" then
-						action = 2 -- Create copy
-					else
-						-- Show bottom menu with file info in title
-						action = ya.which({
-							cands = {
-								{ desc = string.format("File: %s", file_name), on = "|" },
-								{ desc = string.format("Progress: %d/%d", i, #file_uris), on = "|" },
-								{ desc = "", on = "|" },
-								{ desc = "Overwrite", on = "o" },
-								{ desc = "Create copy (_copy)", on = "c" },
-								{ desc = "Skip file", on = "q" },
-								{ desc = "Overwrite All", on = "O" },
-								{ desc = "Create copy All", on = "C" },
-								{ desc = "Cancel All", on = "Q" },
-							},
-						})
-
-						-- Adjust action index since first three items are info only
-						if action and action > 3 then
-							action = action - 3
-						elseif action and action <= 3 then
-							action = nil
-						end
-
-						-- Set bulk actions is selected
-						if action == 4 then
-							bulk_action = "overwrite_all"
-							action = 1
-						elseif action == 5 then
-							bulk_action = "copy_all"
-							action = 2
-						elseif action == 6 then
-							bulk_action = "cancel_all"
-							break
-						end
-					end
-
-					if action == 1 then -- Overwrite
-						-- Try to remove as file first
-						local deleted_collided_item, err = fs.remove("file", file_path)
-						if not deleted_collided_item then
-							-- If it failed because it's a directory, handle it by overwriting contents
-							if err and tostring(err):match("Is a directory") then
-								local handled = handle_directory_collision(file_path, file_uri, file_content, no_hover)
-								if handled then
-									success_count = success_count + 1
-								else
-									warn("Failed to overwrite directory contents: %s", tostring(file_path))
-								end
-							else
-								-- Try to write anyway - fs.write might handle overwrite
-								local wrote, write_err = fs.write(file_path, file_content)
-								if wrote then
-									success_count = success_count + 1
-									if not no_hover then
-										ya.emit("reveal", {
-											tostring(file_path),
-											tab = get_current_tab_id(),
-											no_dummy = true,
-											raw = true,
-										})
-									end
-								else
-									warn(
-										"Failed to overwrite file: %s (delete err: %s, write err: %s)",
-										tostring(file_path),
-										tostring(err),
-										tostring(write_err)
-									)
-								end
-							end
-						else
-							if file_path.parent then
-								fs.create("dir_all", file_path.parent)
-							end
-							fs.write(file_path, file_content)
-							success_count = success_count + 1
-							if not no_hover then
-								ya.emit(
-									"reveal",
-									{ tostring(file_path), tab = get_current_tab_id(), no_dummy = true, raw = true }
-								)
-							end
-						end
-					elseif action == 2 then -- Create copy
-						-- Generate copy filename with simple _copy suffix
-						local copy_name = file_name:gsub("(%.%w+)$", "_copy%1")
-						if not copy_name:match("_copy") then
-							copy_name = copy_name .. "_copy"
-						end
-						local copy_path = Url(pathJoin(get_cwd(), copy_name))
-
-						if copy_path.parent then
-							fs.create("dir_all", copy_path.parent)
-						end
-						fs.write(copy_path, file_content)
-						success_count = success_count + 1
-						if not no_hover then
-							ya.emit(
-								"reveal",
-								{ tostring(copy_path), tab = get_current_tab_id(), no_dummy = true, raw = true }
-							)
-						end
-					end
-					-- If action == 3 (Cancel) or nil, do nothing
-				else
-					if file_path.parent then
-						fs.create("dir_all", file_path.parent)
-					end
-					fs.write(file_path, file_content)
-					success_count = success_count + 1
-					if not no_hover then
-						ya.emit(
-							"reveal",
-							{ tostring(file_path), tab = get_current_tab_id(), no_dummy = true, raw = true }
-						)
-					end
-				end
-			else
-				warn("Failed to read file: %s", file_uri)
+			local removed, remove_err = fs.remove(tree.kind == "dir" and "dir" or "file", reserved)
+			if not removed then
+				warn("Cannot remove reserved destination %s: %s", tostring(reserved), tostring(remove_err))
 			end
 		end
+		cleanup_stage(stage)
+		return nil, "Cannot install destination: " .. tostring(ierr)
 	end
+	cleanup_stage(stage)
+	return target
+end
 
+local function file_target(target, name)
+	while true do
+		local safe, err = destination_safe(target)
+		if not safe then
+			return nil, nil, err
+		end
+		local cha, cerr = transfer_stat(target)
+		if cerr then
+			return nil, nil, cerr
+		elseif not cha or not cha.is_dir then
+			return target, cha
+		end
+		target = target:join(name)
+	end
+end
+
+local function collision_action(kind, name, index, total)
+	local candidates, actions = {}, {}
+	local function offer(key, description, action)
+		local at = #candidates + 1
+		candidates[at] = { on = key, desc = description }
+		actions[at] = action
+	end
+	offer("|", (kind == "dir" and "Directory: " or "File: ") .. name, "skip")
+	offer("|", string.format("Progress: %d/%d", index, total), "skip")
+	offer("|", "", "skip")
+	offer("o", "Overwrite", "overwrite")
+	if kind == "dir" then
+		offer("m", "Merge contents", "merge")
+	end
+	offer("c", "Create copy (_copy)", "copy")
+	offer("q", kind == "dir" and "Skip directory" or "Skip file", "skip")
+	offer("O", "Overwrite All", "overwrite_all")
+	offer("C", "Create copy All", "copy_all")
+	offer("Q", "Cancel All", "cancel_all")
+	local selected = ya.which({ cands = candidates })
+	return selected and actions[selected] or "skip"
+end
+
+local function reveal_transfer(url, no_hover)
+	if not no_hover then
+		ya.emit("reveal", { tostring(url), tab = get_current_tab_id(), no_dummy = true, raw = true })
+	end
+end
+
+function M:handle_file_list_paste(file_uris, no_hover, show_notify)
+	local cwd, root_err = destination_cwd()
+	if not cwd then
+		warn("%s", root_err)
+		return
+	end
+	local success_count, bulk_action = 0, nil
+	for index, raw in ipairs(file_uris) do
+		local function paste_item()
+			local path, perr = absolute_path(raw)
+			if not path then
+				return nil, perr
+			end
+			local source = Url(path)
+			local cha, cerr = transfer_stat(source)
+			if not cha then
+				return nil, cerr or ("Source does not exist: " .. path)
+			end
+			local kind, name = transfer_kind(cha), get_filename_from_path(path)
+			if not kind or not name then
+				return nil, "Unsupported source: " .. path
+			end
+			local target = cwd:join(name)
+			local safe, serr = destination_safe(target)
+			if not safe then
+				return nil, serr
+			end
+			local target_cha, terr = transfer_stat(target)
+			if terr then
+				return nil, terr
+			end
+			local action = "overwrite"
+			if target_cha then
+				action = bulk_action or collision_action(kind, name, index, #file_uris)
+				if action == "cancel_all" or action == "skip" then
+					return action
+				elseif action == "overwrite_all" then
+					bulk_action, action = "overwrite", "overwrite"
+				elseif action == "copy_all" then
+					bulk_action, action = "copy", "copy"
+				end
+			end
+			if action == "copy" then
+				local copy, copy_err = copy_destination(target, kind)
+				if not copy then
+					return nil, copy_err
+				end
+				target, target_cha = copy, nil
+			elseif kind ~= "dir" and target_cha and target_cha.is_dir then
+				local final, final_cha, ferr = file_target(target, name)
+				if not final then
+					return nil, ferr
+				end
+				target, target_cha = final, final_cha
+			end
+			local separate, oerr = transfer_overlap(source, cha, target, target_cha)
+			if not separate then
+				return nil, oerr
+			end
+			local tree, tree_err = snapshot_tree(source, cha)
+			if not tree then
+				return nil, tree_err
+			end
+			if action == "merge" and target_cha and target_cha.is_dir then
+				local merged, merr = snapshot_tree(target, target_cha)
+				if not merged then
+					return nil, merr
+				end
+				for child_name, child in pairs(tree.children) do
+					local ok, err = merge_child(merged, child_name, child)
+					if not ok then
+						return nil, err
+					end
+				end
+				tree = merged
+			end
+			return install_tree(tree, target, target_cha)
+		end
+		local result, err = paste_item()
+		if result == "cancel_all" then
+			break
+		elseif result and result ~= "skip" then
+			success_count = success_count + 1
+			reveal_transfer(result, no_hover)
+		elseif err then
+			warn("Failed to paste item %d/%d: %s", index, #file_uris, err)
+		end
+	end
 	if success_count > 0 and show_notify then
 		ya.notify({
 			title = PackageName,
@@ -1096,8 +969,6 @@ local function input_file_name(default_name)
 		title = "Paste into a new file. Enter file name:",
 		value = default_name or "",
 		pos = pos,
-		-- TODO: remove this after next yazi released
-		position = pos,
 	})
 	if input_event == 1 then
 		if not input_value or input_value == "" then
@@ -1122,132 +993,103 @@ function M:handle_text_paste(clipboard_content, no_hover, show_notify)
 	M:save_file_with_conflict_handling(file_name, clipboard_content, no_hover, show_notify)
 end
 
--- Common function to save file with conflict handling
+-- Text and image bytes share the same private staging/transaction path.
 function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hover, show_notify)
-	-- Save the file
-	local file_path = Url(pathJoin(get_cwd(), file_name))
-	local cha, _ = fs.cha(file_path)
+	local cwd, err = destination_cwd()
+	if not cwd then
+		warn("%s", err)
+		return false
+	end
+	if type(file_name) ~= "string" or file_name == "" or file_name:sub(1, 1) == "/"
+		or file_name:sub(-1) == "/" or file_name:find("\0", 1, true)
+	then
+		warn("Invalid file name: %s", tostring(file_name))
+		return false
+	end
+	local target = cwd
+	for component in file_name:gmatch("[^/]+") do
+		if component == "." or component == ".." then
+			warn("Dot path components are not allowed")
+			return false
+		end
+		target = target:join(component)
+	end
+	local target_safe, target_err = destination_safe(target)
+	if not target_safe then
+		warn("%s", target_err)
+		return false
+	end
+	local cha, stat_err = transfer_stat(target)
+	if stat_err then
+		warn("%s", stat_err)
+		return false
+	end
+	local action = "overwrite"
+	local notification = "Created: %s"
 	if cha then
-		-- File exists, ask user what to do
-		local pos = get_state(STATE.OVERWRITE_CONFIRM_POSITION)
-		pos = pos or { "center", w = 80, h = 20 }
-
-		-- Show bottom menu with file info as menu items
-		local action = ya.which({
-			cands = {
-				{ desc = "Overwrite", on = "o" },
-				{ desc = "Create copy (_copy)", on = "c" },
-				{ desc = "Cancel", on = "q" },
-			},
-		})
-
-		if action == 1 then -- Overwrite
-			local deleted_collided_item, err = fs.remove("file", file_path)
-			if not deleted_collided_item then
-				-- If it failed because it's a directory, warn and return
-				if err and tostring(err):match("Is a directory") then
-					warn("Cannot overwrite directory with file: %s", tostring(file_path))
-					return
-				else
-					-- Try to write anyway - fs.write might handle overwrite
-					local wrote, write_err = fs.write(file_path, clipboard_content)
-					if not wrote then
-						warn(
-							"Failed to overwrite file: %s (delete err: %s, write err: %s)",
-							tostring(file_path),
-							tostring(err),
-							tostring(write_err)
-						)
-						return
-					end
-					if not no_hover then
-						ya.emit(
-							"reveal",
-							{ tostring(file_path), tab = get_current_tab_id(), no_dummy = true, raw = true }
-						)
-					end
-					if show_notify then
-						ya.notify({
-							title = PackageName,
-							content = string.format("Overwritten: %s", file_name),
-							timeout = 3,
-							level = "info",
-						})
-					end
-					return
-				end
-			end
-			-- File was successfully deleted, now write the new content
-			if file_path.parent then
-				fs.create("dir_all", file_path.parent)
-			end
-			local wrote = fs.write(file_path, clipboard_content)
-			if wrote then
-				if not no_hover then
-					ya.emit("reveal", { tostring(file_path), tab = get_current_tab_id(), no_dummy = true, raw = true })
-				end
-				if show_notify then
-					ya.notify({
-						title = PackageName,
-						content = string.format("Overwritten: %s", file_name),
-						timeout = 3,
-						level = "info",
-					})
-				end
-			else
-				warn("Failed to write file after deletion: %s", tostring(file_path))
-			end
-		elseif action == 2 then -- Create copy
-			-- Generate copy filename with simple _copy suffix
-			local copy_name = file_name:gsub("(%.%w+)$", "_copy%1")
-			if not copy_name:match("_copy") then
-				copy_name = copy_name .. "_copy"
-			end
-			local copy_path = Url(pathJoin(get_cwd(), copy_name))
-
-			if copy_path.parent then
-				fs.create("dir_all", copy_path.parent)
-			end
-			local wrote = fs.write(copy_path, clipboard_content)
-			if wrote then
-				if not no_hover then
-					ya.emit("reveal", { tostring(copy_path), tab = get_current_tab_id(), no_dummy = true, raw = true })
-				end
-				if show_notify then
-					ya.notify({
-						title = PackageName,
-						content = string.format("Created copy: %s", copy_name),
-						timeout = 3,
-						level = "info",
-					})
-				end
-			else
-				warn("Failed to create copy: %s", tostring(copy_path))
-			end
+		local choices = {
+			{ on = "o", desc = "Overwrite", action = "overwrite" },
+			{ on = "c", desc = "Create copy (_copy)", action = "copy" },
+			{ on = "q", desc = "Cancel", action = "cancel" },
+		}
+		local candidates = {}
+		for i, choice in ipairs(choices) do
+			candidates[i] = { on = choice.on, desc = choice.desc }
 		end
-		-- If action == 3 (Cancel) or nil, do nothing - file is not saved
-	else
-		-- File doesn't exist, create it
-		if file_path.parent then
-			fs.create("dir_all", file_path.parent)
-		end
-		local wrote = fs.write(file_path, clipboard_content)
-		if wrote then
-			if not no_hover then
-				ya.emit("reveal", { tostring(file_path), tab = get_current_tab_id(), no_dummy = true, raw = true })
+		local selected = ya.which({ cands = candidates })
+		action = selected and choices[selected].action or "cancel"
+		if action == "cancel" then
+			return false
+		elseif action == "copy" then
+			local copy, copy_err = copy_destination(target, "file")
+			if not copy then
+				warn("%s", copy_err)
+				return false
 			end
-			if show_notify then
-				ya.notify({
-					title = PackageName,
-					content = string.format("Created: %s", file_name),
-					timeout = 3,
-					level = "info",
-				})
-			end
+			target, cha = copy, nil
+			notification = "Created copy: %s"
 		else
-			warn("Failed to create file: %s", tostring(file_path))
+			notification = "Overwritten: %s"
+			local final, final_cha, final_err = file_target(target, target.name)
+			if not final then
+				warn("%s", final_err)
+				return false
+			end
+			target, cha = final, final_cha
 		end
 	end
+	-- Canonicalize before creating directories; missing parents are resolved
+	-- through their nearest existing ancestor, never unchecked string paths.
+	local canonical, canonical_err = canonical_leaf(target, cha)
+	if not canonical then
+		warn("%s", canonical_err)
+		return false
+	end
+	local made, make_err = fs.create("dir_all", target.parent)
+	if not made then
+		warn("Cannot create destination parent: %s", tostring(make_err))
+		return false
+	end
+	local tree = {
+		kind = "data",
+		data = clipboard_content,
+		mode = cha and transfer_mode(cha) or "0600",
+	}
+	local final, install_err = install_tree(tree, target, cha)
+	if not final then
+		warn("Failed to save file: %s", install_err)
+		return false
+	end
+	reveal_transfer(final, no_hover)
+	if show_notify then
+		ya.notify({
+			title = PackageName,
+			content = string.format(notification, final.name),
+			timeout = 3,
+			level = "info",
+		})
+	end
+	return true
 end
 
 --==============================================================================
@@ -1268,56 +1110,6 @@ local yanked_info = ya.sync(function()
 	return paths, cx.yanked.is_cut
 end)
 
--- Returns an array of mimetype strings, or nil if unavailable
-local function get_clipboard_mimetypes()
-	-- Try macOS first
-	local handle = io.popen("osascript -e 'return (clipboard info) as string' 2>/dev/null")
-	if handle then
-		local info = handle:read("*a")
-		handle:close()
-
-		if info then
-			-- macOS returns different format
-			-- Format: "«class PNGf», «class JPEG», picture, text" etc.
-			local mimetypes = {}
-			for item in info:gmatch("[^,]+") do
-				local trimmed_item = item:match("^%s*(.-)%s*$") -- trim
-				if trimmed_item and trimmed_item ~= "" then
-					table.insert(mimetypes, trimmed_item)
-				end
-			end
-			if #mimetypes > 0 then
-				return mimetypes
-			end
-		end
-	end
-
-	-- Try Linux clipboard tools (xclip or wl-paste)
-	handle = io.popen("xclip -selection clipboard -o -t TARGETS 2>/dev/null || wl-paste --list-types 2>/dev/null")
-	if not handle then
-		return nil
-	end
-
-	local targets = handle:read("*a")
-	handle:close()
-
-	if targets then
-		-- Split targets by newline and return as array
-		local mimetypes = {}
-		for mimetype in targets:gmatch("[^\r\n]+") do
-			local trimmed_mimetype = mimetype:match("^%s*(.-)%s*$") -- trim
-			if trimmed_mimetype and trimmed_mimetype ~= "" then
-				table.insert(mimetypes, trimmed_mimetype)
-			end
-		end
-		if #mimetypes > 0 then
-			return mimetypes
-		end
-	end
-
-	return nil
-end
-
 -- Check if mimetypes array contains a mimetype that contains the substring
 local function has_mimetype(mimetypes, substring)
 	if not mimetypes then
@@ -1332,84 +1124,53 @@ local function has_mimetype(mimetypes, substring)
 end
 
 function M:paste_entry(job)
-	local no_hover = job.args.no_hover == nil and false or job.args.no_hover
+	local args = job.args or {}
+	local no_hover = args.no_hover or false
 	local show_notify = false
-	for _, arg in ipairs(job.args or {}) do
-		if arg == "notify" then
-			show_notify = true
-			break
-		end
+	for _, arg in ipairs(args) do
+		show_notify = show_notify or arg == "notify"
 	end
-
-	-- 1: Check if there are yanked files in the app state
-	local yanked_files, is_cut = yanked_info(job.args[1])
-
+	local yanked_files, is_cut = yanked_info()
 	if is_cut then
-		-- If there are cut files, paste them using native command
 		ya.emit("paste", {})
 		ya.emit("unyank", {})
 		return
 	end
 
-	-- Get available clipboard mimetypes and route workflow based on them
-	local available_mimetypes = get_clipboard_mimetypes()
-	if available_mimetypes then
-		local mimetypes_display = table.concat(available_mimetypes, ", ")
-		ya.dbg("Available clipboard mimetypes:", mimetypes_display)
-	end
-
-	if available_mimetypes then
-		-- 2: Handle text/uri-list and code/file-list clipboard mimetype
-		if
-			has_mimetype(available_mimetypes, "code/file-list") or has_mimetype(available_mimetypes, "text/uri-list")
-		then
-			local file_uris = get_clipboard_file_uris()
-			if file_uris and #file_uris > 0 then
-				M:handle_file_list_paste(file_uris, no_hover, show_notify)
+	local mimetypes, backend = get_clipboard_mimetypes()
+	if mimetypes then
+		if has_mimetype(mimetypes, "code/file-list") or has_mimetype(mimetypes, "text/uri-list") then
+			local paths = get_clipboard_file_uris(mimetypes, backend)
+			if paths then
+				M:handle_file_list_paste(paths, no_hover, show_notify)
 				ya.emit("unyank", {})
 				return
 			end
-			if #yanked_files > 0 then
-				ya.emit("paste", {})
-				ya.emit("unyank", {})
-			end
+			-- A failed file representation may still have a usable image or text.
+		end
+		if has_mimetype(mimetypes, "image/") then
+			M:handle_image_paste(table.concat(mimetypes, "\n"), no_hover, show_notify, backend)
+			ya.emit("unyank", {})
 			return
 		end
-
-		-- 3: Handle image/* mimetype
-		if has_mimetype(available_mimetypes, "image/") then
-			local image_targets = get_clipboard_image_targets()
-			if image_targets then
-				M:handle_image_paste(image_targets, no_hover, show_notify)
-				ya.emit("unyank", {})
-				return
-			end
-		end
-
-		-- 4: Handle text/plain mimetype - suggest creating a new file
-		if
-			has_mimetype(available_mimetypes, "text/plain")
-			or has_mimetype(available_mimetypes, "TEXT")
-			or has_mimetype(available_mimetypes, "STRING")
-		then
-			local clipboard_content = ya.clipboard()
-			if clipboard_content and clipboard_content ~= "" then
-				M:handle_text_paste(clipboard_content, no_hover, show_notify)
-				ya.emit("unyank", {})
-				return
+		for _, mime in ipairs(mimetypes) do
+			if mime:match("^text/plain") or mime == "UTF8_STRING" or mime == "TEXT" or mime == "STRING" then
+				local content = read_clipboard(backend == "mac" and "text/plain" or mime, backend)
+				if content and content ~= "" then
+					M:handle_text_paste(content, no_hover, show_notify)
+					ya.emit("unyank", {})
+					return
+				end
 			end
 		end
 	end
 
-	-- Fallback: Natively paste yanked files if there were any
-	-- Could be useful for using yazi in tty
 	if #yanked_files > 0 then
 		ya.emit("paste", {})
 		ya.emit("unyank", {})
 		return
 	end
-
-	warn("Clipboard does not contain any supported mimetypes")
+	warn("Clipboard does not contain readable supported data")
 end
 
 --==============================================================================

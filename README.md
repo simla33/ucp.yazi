@@ -45,7 +45,8 @@ ya pkg add simla33/ucp
 ## Configuration
 
 > [!NOTE]
-> You need yazi 3.x for this plugin to work.
+> Requires Yazi 26.8.15 or newer. Selected and yanked entries are `File` objects;
+> the plugin reads each entry's `url` when collecting file paths.
 
 ```toml
 [mgr]

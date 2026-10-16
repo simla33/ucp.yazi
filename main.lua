@@ -182,7 +182,7 @@ end
 local selected_or_hovered = ya.sync(function()
 	local tab, paths = cx.active, {}
 	for _, u in pairs(tab.selected) do
-		paths[#paths + 1] = tostring(u)
+		paths[#paths + 1] = tostring(u.url)
 	end
 	if #paths == 0 and tab.current.hovered then
 		paths[1] = tostring(tab.current.hovered.url)
@@ -1262,7 +1262,7 @@ end
 local yanked_info = ya.sync(function()
 	local paths = {}
 	for _, u in pairs(cx.yanked) do
-		paths[#paths + 1] = tostring(u)
+		paths[#paths + 1] = tostring(u.url)
 	end
 
 	return paths, cx.yanked.is_cut

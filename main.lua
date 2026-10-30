@@ -149,16 +149,20 @@ local function linux_backends()
 	return { "x11", "wayland" }
 end
 
+-- A plain JS array turns each NSURL into an NSDictionary, which writeObjects rejects.
+-- Reading back once keeps every item; otherwise only the first survives osascript exiting.
 local MAC_COPY = [[
 ObjC.import('AppKit');
 function run() {
     var data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
     var text = ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding));
-    var urls = text.split(/\r?\n/).filter(function(s) { return s.length > 0; })
-        .map(function(s) { return $.NSURL.URLWithString(s); });
+    var urls = $.NSMutableArray.array;
+    text.split(/\r?\n/).filter(function(s) { return s.length > 0; })
+        .forEach(function(s) { urls.addObject($.NSURL.URLWithString(s)); });
     var pb = $.NSPasteboard.generalPasteboard;
     pb.clearContents;
     if (!pb.writeObjects(urls)) throw new Error('Cannot write file URLs to clipboard');
+    pb.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), $.NSDictionary.dictionary);
 }
 ]]
 

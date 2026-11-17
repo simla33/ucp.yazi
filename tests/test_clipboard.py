@@ -3,6 +3,7 @@ import datetime
 import os
 import shutil
 import time
+import unittest
 
 from support.integration import IntegrationTest, PNG, eventually, file_uri, tree
 
@@ -21,6 +22,77 @@ class ClipboardTransfers(IntegrationTest):
         self.assertTrue(data.endswith(b"\r\n"))
         self.assertNotIn(b"\nname", data, "native path newline leaked into URI framing")
         self.assertEqual(tree(self.src), before)
+
+    @unittest.skipUnless(shutil.which("fd"), "fd required for real search-view coverage")
+    def test_search_hovered_copy_exports_local_path_and_pastes(self):
+        source = self.write(self.src / "nested" / "O'Brien-ü-%25.pdf", b"search result bytes")
+        self.write(self.src / "ignored.txt", b"not a search result")
+        before = tree(self.src)
+        self.start(self.src)
+        self.emit("search_do", "pdf", "--via=fd")
+        self.state(lambda s: s[0].startswith("search://") and s[1].startswith("search://"),
+                   "search result hover")
+        self.begin("copy")
+        self.finish("copy")
+        self.assertEqual(self.clip_read(), (file_uri(source) + "\r\n").encode())
+        self.cd(self.dst)
+        self.begin()
+        self.finish()
+        self.assertEqual((self.dst / source.name).read_bytes(), source.read_bytes())
+        self.assertEqual(tree(self.src), before)
+        self.no_staging()
+
+    @unittest.skipUnless(shutil.which("fd"), "fd required for real search-view coverage")
+    def test_search_selected_copy_exports_all_encoded_local_paths_and_pastes(self):
+        names = ["space name.pdf", "O'Brien-ü-文.pdf", "literal%25.pdf", "brackets[()].pdf", "trailing.pdf "]
+        paths = [self.write(self.src / str(i) / name, name.encode()) for i, name in enumerate(names)]
+        self.write(self.src / "ignored.txt", b"not a search result")
+        before = tree(self.src)
+        self.start(self.src)
+        self.emit("search_do", "pdf", "--via=fd")
+        self.state(lambda s: s[0].startswith("search://") and s[1].startswith("search://"),
+                   "search result hover")
+        self.select_all(len(paths))
+        self.begin("copy")
+        self.finish("copy")
+        self.assertEqual(set(self.clip_read().decode().splitlines()), set(file_uri(p) for p in paths))
+        self.cd(self.dst)
+        self.begin()
+        self.finish()
+        self.assertEqual({p.name: p.read_bytes() for p in self.dst.iterdir()},
+                         {p.name: p.read_bytes() for p in paths})
+        self.assertEqual(tree(self.src), before)
+        self.no_staging()
+
+    def _reject_virtual_copy(self, mixed):
+        self.write(self.src / "a-local", b"selected only in mixed case")
+        source = self.write(self.src / "z-remote", b"must not export this local alias")
+        previous = self.write(self.root / "previous", b"existing clipboard file")
+        self.files_clip([previous])
+        original_clipboard = self.clip_read()
+        before = tree(self.src)
+        self.env["UCP_VIRTUAL_SOURCE"] = str(source)
+        (self.config / "vfs.toml").write_text(
+            '[sftp.ucp-test]\nhost = "127.0.0.1"\nuser = "ucp-test"\nport = 1\n')
+        self.start(self.src)
+        count = 2 if mixed else 1
+        if mixed:
+            self.emit("toggle", "--state=on")
+            self.state(lambda s: int(s[2]) == 1, "local selection")
+        self.emit("plugin", "ucp-test", "select-virtual")
+        self.state(lambda s: int(s[2]) == count, "virtual selection")
+        self.begin("copy")
+        self.finish("copy")
+        self.assertEqual(self.clip_read(), original_clipboard)
+        self.state(lambda s: int(s[3]) == count, "native virtual yank retained")
+        self.assertEqual(tree(self.src), before)
+        self.no_staging()
+
+    def test_virtual_copy_preserves_clipboard_and_native_yank(self):
+        self._reject_virtual_copy(mixed=False)
+
+    def test_mixed_local_virtual_copy_does_not_publish_partial_selection(self):
+        self._reject_virtual_copy(mixed=True)
 
     def test_missing_wayland_helpers_fall_back_to_xclip(self):
         source = self.write(self.src / "fallback.txt", b"X11 clipboard bytes")

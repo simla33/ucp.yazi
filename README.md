@@ -48,7 +48,7 @@ ya pkg add simla33/ucp
 
 > [!NOTE]
 > Requires Yazi 26.8.15 or newer. Selected and yanked entries are `File` objects;
-> the plugin reads each entry's `url` when collecting file paths.
+> the plugin checks each entry's URL kind before exporting its local `url.path`.
 
 ```toml
 [mgr]
@@ -72,6 +72,7 @@ prepend_keymap = [
 
 - External copied files, images, or text take precedence over an internal copied selection. A native **cut** always uses Yazi's move operation instead.
 - File lists use percent-encoded local `file://` URLs, including `file://localhost/…`. Unicode, quotes, percent signs, CR/LF, and trailing filename whitespace are preserved. Remote authorities and ambiguous raw newline-separated POSIX lists are not interpreted as local file selections.
+- Copying local search results exports their filesystem paths, not `search://` URLs. If any selected entry belongs to a virtual filesystem (including SFTP), the entire external export is refused: the system clipboard is unchanged and the native yank is retained. Use Yazi's built-in paste action for that yank; ucp's normal external-clipboard precedence still applies.
 - Source symlinks are copied **as links**, including dangling links and directory links with a trailing slash. Empty directories are retained. A directory symlink is not recursively dereferenced.
 - Source/destination equality and ancestor/descendant overlap are rejected, including aliases through source-parent symlinks. Destination symlinks are rejected rather than followed. Ancestor aliases above a real chosen working directory are resolved first; choosing a symlink itself as the destination root is rejected.
 - **Overwrite** replaces a directory only after its complete replacement is prepared. **Merge** prepares a merged tree and preserves unrelated entries. Overwriting a file onto an existing directory puts it inside that directory, using the same basename.
@@ -92,9 +93,9 @@ macOS images are converted to PNG using a private temporary directory. Paths are
 python -B -m unittest discover -s tests -v
 ```
 
-The Linux suite launches real Yazi in a PTY with private Xvfb/Xauthority/clipboard state and a read-only-host bubblewrap sandbox. It covers copy/cut precedence, all collision keys, unique names, links and empty directories, filename framing and traversal escapes, private directory modes, read/staging failures, and injected final-rename rollback.
+The Linux suite launches real Yazi in a PTY with private Xvfb/Xauthority/clipboard state and a read-only-host bubblewrap sandbox. It covers copy/cut precedence, local search-result exports, refusal of virtual/mixed exports, all collision keys, unique names, links and empty directories, filename framing and traversal escapes, private directory modes, read/staging failures, and injected final-rename rollback. Virtual-selection cases use real Yazi URL/File objects with fixture metadata; they do not connect to an SFTP server.
 
-Requirements: Python 3, `yazi`, `ya`, `bwrap`, `Xvfb`, `xclip`, and the filesystem helpers above. A C compiler is optional for the rename-failure case; permission-denial cases require a non-root user.
+Requirements: Python 3, `yazi`, `ya`, `bwrap`, `Xvfb`, `xclip`, and the filesystem helpers above. `fd` is required for search-view cases. A C compiler is optional for the rename-failure case; permission-denial cases require a non-root user.
 
 The macOS cases simulate the unavailable `osascript`/`pbpaste` executable boundary to exercise Lua framing, argv handling, private temporary paths, and cleanup. They **do not execute AppKit/JXA**. Native macOS clipboard/image conversion and a real Wayland compositor still require platform verification before claiming those backends are validated.
 

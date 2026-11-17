@@ -88,7 +88,17 @@ function M:entry(job)
         assert(fs.write(Url(os.getenv("UCP_PROBE")), probe()))
         return
     end
-    ucp:entry({args = {action, "notify"}})
+    if action == "select-virtual" then
+        -- Real URL/File/selection objects, without connecting to an SFTP server.
+        local source = Url(os.getenv("UCP_VIRTUAL_SOURCE"))
+        local file = File({
+            url = Url("sftp://ucp-test/" .. tostring(source.path)),
+            cha = assert(fs.cha(source, false)),
+        })
+        ya.emit("toggle", {file, state = "on"})
+        return
+    end
+    ucp:entry(job)
     assert(fs.write(Url(os.getenv("UCP_DONE")), action))
 end
 return M
@@ -234,8 +244,8 @@ class IntegrationTest(unittest.TestCase):
         (self.config / "yazi.toml").write_text('[mgr]\nshow_hidden = true\nsort_by = "alphabetical"\n')
         (self.config / "keymap.toml").write_text('''[mgr]
 prepend_keymap = [
-  { on = "p", run = "plugin ucp-test paste" },
-  { on = "y", run = "plugin ucp-test copy" },
+  { on = "p", run = "plugin ucp-test -- paste notify" },
+  { on = "y", run = "plugin ucp-test -- copy notify" },
   { on = "r", run = "plugin ucp-test probe" },
 ]
 ''')

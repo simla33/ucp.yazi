@@ -104,14 +104,21 @@ end
 -- Copy BEGIN
 --==============================================================================
 
--- Get selected or hovered files using ya.sync
+-- Export only local paths; keep virtual URLs intact in Yazi's native selection.
 local selected_or_hovered = ya.sync(function()
 	local tab, paths = cx.active, {}
 	for _, u in pairs(tab.selected) do
-		paths[#paths + 1] = tostring(u.url)
+		paths[#paths + 1] = u.url
 	end
 	if #paths == 0 and tab.current.hovered then
-		paths[1] = tostring(tab.current.hovered.url)
+		paths[1] = tab.current.hovered.url
+	end
+	for i, url in ipairs(paths) do
+		local spec = url.spec
+		if not (spec.is_regular or spec.is_search) then
+			return nil
+		end
+		paths[i] = tostring(url.path)
 	end
 	return paths
 end)
@@ -169,13 +176,17 @@ function M:copy_entry(job)
 	end
 	ya.emit("escape", { visual = true })
 	local paths = selected_or_hovered()
-	if #paths == 0 then
+	if paths and #paths == 0 then
 		if show_notify then
 			warn("No file selected")
 		end
 		return
 	end
 	ya.emit("yank", {})
+	if not paths then
+		warn("External copy supports local files and search results only; native yank retained. Use Yazi's built-in paste for virtual files.")
+		return
+	end
 
 	local uris = {}
 	for _, path in ipairs(paths) do

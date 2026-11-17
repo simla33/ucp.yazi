@@ -1,8 +1,8 @@
 --[[
 Universal Copy/Paste for Yazi
 
-    plugin ucp copy [notify]
-    plugin ucp paste [notify]
+    plugin ucp -- copy [notify]
+    plugin ucp -- paste [notify]
 
 Native cuts use Yazi's paste command. Otherwise, external file URLs, images,
 and text take precedence over internal copied files. Unsupported clipboard

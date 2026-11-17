@@ -58,13 +58,13 @@ prepend_keymap = [
 ]
 ```
 
-You can enable notifications for successful/failed operations:
+You can enable notifications for successful/failed operations. Yazi passes only the first word after the plugin name unless the arguments follow `--`:
 
 ```toml
 [mgr]
 prepend_keymap = [
-    { on = "p", run = "plugin ucp paste notify", desc = "Paste" },
-    { on = "y", run = "plugin ucp copy notify", desc = "Copy" }
+    { on = "p", run = "plugin ucp -- paste notify", desc = "Paste" },
+    { on = "y", run = "plugin ucp -- copy notify", desc = "Copy" }
 ]
 ```
 

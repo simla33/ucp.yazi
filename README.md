@@ -138,7 +138,7 @@ Native Wayland tests start a private headless Sway compositor and use real `wl-c
 
 The macOS cases simulate the `osascript`/`pbpaste` executable boundary to exercise Lua framing, argv handling, private temporary paths, and cleanup; they do **not execute AppKit/JXA**. Alex Cicovic independently verified single/multi-file Finder copy on macOS 15.6 with Yazi 26.9.1 in [PR #18](https://github.com/simla33/ucp.yazi/pull/18). Native macOS image conversion still needs platform verification.
 
-Native Windows coverage uses real Yazi in ConPTY and real WinForms clipboard data, with Unix tools excluded from the plugin's `PATH`. On a disposable Windows desktop with Python 3.12, `pywinpty==3.0.2`, and Yazi installed:
+Native Windows coverage uses real Yazi in ConPTY and real WinForms clipboard data, with Unix tools excluded from the plugin's `PATH`. On a disposable x64 Windows desktop, install Python 3.12, `pywinpty==3.0.2`, Yazi, and the [Microsoft Visual C++ x64 runtime](https://aka.ms/vs/17/release/vc_redist.x64.exe):
 
 ```powershell
 $env:UCP_WINDOWS_TESTS = '1'
@@ -146,6 +146,8 @@ python -m unittest discover -s tests -p test_windows_native.py -v
 ```
 
 These opt-in tests replace the desktop clipboard with synthetic data; do not enable them on your daily desktop. Ordinary discovery skips them. Use a disposable Windows desktop or Windows VM, including a Docker-managed KVM guest—not a normal Linux container.
+
+Verified: 27 native cases on Windows 10 (build 19045), PowerShell 5.1, and Yazi 26.9.1 in a disposable KVM VM. Other Windows versions have not been tested.
 
 ## Credits
 

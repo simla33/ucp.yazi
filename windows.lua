@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false, $true)
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$stdout = [Console]::OpenStandardOutput()
 
 function Native {
     if ('UcpWindowsNative' -as [type]) { return }
@@ -216,10 +217,23 @@ function Set-AclInfo([string]$path, $directory, $acl) {
     else { [System.IO.File]::SetAccessControl($path, $acl) }
 }
 
-function Write-Text([string]$text) { [Console]::Write($text) }
+function Write-Header([long]$length) {
+    $script:responded = $true
+    [Console]::Write("OK $length`n")
+    [Console]::Out.Flush()
+}
 
-try {
-    $envelope = [Console]::In.ReadToEnd() | ConvertFrom-Json
+function Write-Text([string]$text) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+    Write-Header $bytes.Length
+    if ($bytes.Length -gt 0) {
+        $stdout.Write($bytes, 0, $bytes.Length)
+        $stdout.WriteByte(10)
+        $stdout.Flush()
+    }
+}
+
+function Invoke-Request($envelope) {
     $request = $envelope.request
     switch ([string]$envelope.operation) {
         'copy' {
@@ -280,9 +294,10 @@ try {
                 if ($image -isnot [System.Drawing.Image]) { throw 'No image' }
                 $output = New-Object System.IO.MemoryStream
                 $image.Save($output, [System.Drawing.Imaging.ImageFormat]::Png)
-                $stdout = [Console]::OpenStandardOutput()
+                Write-Header $output.Length
                 $output.Position = 0
                 $output.CopyTo($stdout)
+                $stdout.WriteByte(10)
                 $stdout.Flush()
             } finally {
                 if ($null -ne $output) { $output.Dispose() }
@@ -351,10 +366,21 @@ try {
         'move' { Native; [UcpWindowsNative]::Move([string]$request.source, [string]$request.target) }
         default { throw 'Unsupported operation' }
     }
-} catch {
-    # Never expose stderr, clipboard payloads, filesystem paths, or exception messages.
-    [Console]::Error.Write('Windows backend operation failed.')
-    exit 1
+}
+
+# One worker per plugin action: retain loaded assemblies and the native helper,
+# but never retain a background service after the action ends.
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+    $script:responded = $false
+    try {
+        Invoke-Request ($line | ConvertFrom-Json)
+        if (!$script:responded) { Write-Text '' }
+    } catch {
+        # A partial binary response cannot be followed by another frame.
+        if ($script:responded) { exit 1 }
+        [Console]::Write("ERR`n")
+        [Console]::Out.Flush()
+    }
 }
 ]=]
 
@@ -374,6 +400,26 @@ local ERRORS = {
 	move = "Windows no-replace rename failed",
 }
 
+local child
+
+local function terminate()
+	local process = child
+	child = nil
+	if process then
+		process:start_kill()
+		process:wait()
+	end
+end
+
+function M.close()
+	local process = child
+	child = nil
+	if process then
+		-- Closing stdin ends the request loop before waiting for process exit.
+		process:wait_with_output()
+	end
+end
+
 function M.run(operation, request)
 	local failure = ERRORS[operation]
 	if not failure then
@@ -383,30 +429,60 @@ function M.run(operation, request)
 	if not encoded or type(payload) ~= "string" then
 		return nil, "Windows request encoding failed"
 	end
-	local child = Command("powershell.exe")
-		:arg({ "-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT })
-		:stdin(Command.PIPED)
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:spawn()
 	if not child then
-		return nil, "Windows PowerShell could not be started"
+		child = Command("powershell.exe")
+			:arg({ "-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT })
+			:stdin(Command.PIPED)
+			:stdout(Command.PIPED)
+			:stderr(Command.PIPED)
+			:spawn()
+		if not child then
+			return nil, "Windows PowerShell could not be started"
+		end
 	end
-	local ok = child:write_all(payload)
-	if ok then
-		ok = child:flush()
-	end
-	if not ok then
-		child:start_kill()
-		child:wait()
+	if not child:write_all(payload) or not child:write_all("\n") or not child:flush() then
+		terminate()
 		return nil, "Windows request transport failed"
 	end
-	-- Yazi closes the child's stdin while collecting output. This unblocks ReadToEnd.
-	local output = child:wait_with_output()
-	if not output or not output.status.success then
+	local header, event = child:read_line()
+	if event == 0 and (header == "ERR\n" or header == "ERR\r\n") then
 		return nil, failure
 	end
-	return output.stdout
+	local size = event == 0 and header and header:match("^OK (%d+)\r?\n$")
+	local remaining = size and math.tointeger(tonumber(size))
+	if not remaining or remaining < 0 then
+		terminate()
+		return nil, failure
+	elseif remaining == 0 then
+		return ""
+	end
+	-- read_line preserves raw bytes as Lua strings; Child:read exposes byte
+	-- arrays. A final newline terminates even binary payloads without newlines.
+	remaining = remaining + 1
+	local chunks
+	while remaining > 0 do
+		local data, source = child:read_line()
+		if source ~= 0 or not data or #data == 0 or #data > remaining then
+			terminate()
+			return nil, failure
+		end
+		if #data == remaining then
+			if data:sub(-1) ~= "\n" then
+				terminate()
+				return nil, failure
+			end
+			local tail = data:sub(1, -2)
+			if not chunks then
+				return tail
+			elseif tail ~= "" then
+				chunks[#chunks + 1] = tail
+			end
+			return table.concat(chunks)
+		end
+		chunks = chunks or {}
+		chunks[#chunks + 1] = data
+		remaining = remaining - #data
+	end
 end
 
 return M

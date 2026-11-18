@@ -77,6 +77,7 @@ class WindowsClipboard(WindowsIntegrationTest):
 
     def test_mixed_batch_counts_and_failed_paste_retain_usable_native_yank(self):
         native = self.write(self.src / "native", b"retained native yank")
+        native_bytes = native.read_bytes()
         source = self.root / "external"
         self.write(source / "bundle" / "nested" / "one", b"nested")
         (source / "bundle" / "empty").mkdir()
@@ -98,8 +99,8 @@ class WindowsClipboard(WindowsIntegrationTest):
         self.assertEqual(tree(source), before)
         self.state(lambda s: int(s[3]) == 1, "partial failure retained native yank")
         self.emit("paste")
-        eventually(lambda: (self.dst / native.name).exists(), "retained native yank was not usable")
-        self.assertEqual((self.dst / native.name).read_bytes(), native.read_bytes())
+        eventually(lambda: (self.dst / native.name).read_bytes() == native_bytes,
+                   "retained native yank was not usable")
         self.no_staging()
 
     def test_file_collision_escape_retains_yank_and_originals(self):
@@ -136,8 +137,16 @@ class WindowsClipboard(WindowsIntegrationTest):
         self.assertEqual((self.dst / "note.txt").read_bytes(), text.encode())
         self.no_staging()
 
+    def test_large_unicode_text_preserves_binary_frame_boundaries(self):
+        text = ("λ日本語😀\r\nOK 0\nERR\n" * 5000) + "trailing \t\r\n"
+        self.save_text(text, "large-text.txt")
+        self.counts(1)
+        self.assertEqual((self.dst / "large-text.txt").read_bytes(), text.encode("utf-8"))
+        self.no_staging()
+
     def test_text_filename_cancel_keeps_native_yank_and_writes_nothing(self):
         native = self.write(self.src / "native", b"retained")
+        native_bytes = native.read_bytes()
         self.fixture("set-text", text="discard this fixture")
         self.start(self.src)
         self.yank()
@@ -150,8 +159,8 @@ class WindowsClipboard(WindowsIntegrationTest):
         self.assertEqual(tree(self.dst), {})
         self.state(lambda s: int(s[3]) == 1, "filename cancellation retained yank")
         self.emit("paste")
-        eventually(lambda: (self.dst / native.name).exists(), "cancelled text lost native paste")
-        self.assertEqual((self.dst / native.name).read_bytes(), b"retained")
+        eventually(lambda: (self.dst / native.name).read_bytes() == native_bytes,
+                   "cancelled text lost native paste")
         self.no_staging()
 
     def test_text_rejects_windows_unsafe_names_without_escape(self):
@@ -262,6 +271,7 @@ class WindowsFilesystem(WindowsIntegrationTest):
 
     def test_cancel_all_after_success_counts_remaining_items_and_retains_native_yank(self):
         native = self.write(self.root / "native-selection" / "native", b"retained yank")
+        native_bytes = native.read_bytes()
         first = self.write(self.src / "first", b"already copied")
         collision = self.write(self.src / "collision", b"must not overwrite")
         directory = self.src / "directory"
@@ -279,8 +289,8 @@ class WindowsFilesystem(WindowsIntegrationTest):
         self.assertEqual(tree(self.dst), expected)
         self.state(lambda s: int(s[3]) == 1, "cancel-all retained native yank")
         self.emit("paste")
-        eventually(lambda: (self.dst / native.name).exists(), "cancel-all lost usable native yank")
-        self.assertEqual((self.dst / native.name).read_bytes(), native.read_bytes())
+        eventually(lambda: (self.dst / native.name).read_bytes() == native_bytes,
+                   "cancel-all lost usable native yank")
         self.no_staging()
 
     def test_merge_casefolds_children_preserves_destination_acl_and_unrelated_data(self):
@@ -441,7 +451,7 @@ class WindowsDoctor(WindowsIntegrationTest):
             self.assertIn(key, fields)
         self.assertEqual(fields["Clipboard metadata"], "available")
         self.assertIn("ucp doctor", report)
-        self.assertNotRegex(report, r"[\x00-\x08\x0b-\x1f\x7f]")
+        self.assertNotRegex(report.replace("\r\n", "\n"), r"[\x00-\x08\x0b-\x1f\x7f]")
         return report, fields
 
     def assert_private_report(self, report, *secrets):

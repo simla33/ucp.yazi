@@ -57,7 +57,7 @@ end
 -- Entry BEGIN
 --==============================================================================
 
-function M:entry(job)
+local function dispatch(job)
 	local action = job.args[1]
 
 	ya.dbg("Action", tostring(action), table.concat(job.args or {}, ", "))
@@ -77,6 +77,18 @@ function M:entry(job)
 		warn("Unknown action, requires copy or paste")
 		return
 	end
+end
+
+function M:entry(job)
+	if not windows then
+		return dispatch(job)
+	end
+	local ok, result = pcall(dispatch, job)
+	windows.close()
+	if not ok then
+		error(result, 0)
+	end
+	return result
 end
 
 function M:setup(opts)

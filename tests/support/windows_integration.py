@@ -181,6 +181,8 @@ class ConPty:
         self.thread.start()
 
     def _drain(self):
+        pending = ""
+        queries = re.compile(r"\x1b\[(0?c|6n)")
         while True:
             try:
                 chunk = self.process.read(65536)
@@ -188,6 +190,18 @@ class ConPty:
                 return
             with self.lock:
                 self.output += chunk
+            # ConPTY forwards terminal queries to its host. Answer the startup
+            # handshake rather than racing Yazi's terminal-detection timeout.
+            pending += chunk
+            consumed = 0
+            for query in queries.finditer(pending):
+                reply = "\x1b[1;1R" if query[1] == "6n" else "\x1b[?1;2c"
+                try:
+                    self.process.write(reply)
+                except (EOFError, OSError):
+                    return
+                consumed = query.end()
+            pending = pending[max(consumed, len(pending) - 3):]
 
     def send(self, keys):
         self.process.write(keys.decode("utf-8") if isinstance(keys, bytes) else keys)
@@ -222,6 +236,10 @@ class WindowsIntegrationTest(unittest.TestCase):
         self.powershell = shutil.which("powershell.exe")
         if not all((self.yazi_bin, self.ya_bin, self.powershell)):
             self.fail("native opt-in requires yazi, ya and Windows PowerShell 5.1 on PATH")
+        # Windows which() may return a cwd-relative match; plugin cwd changes.
+        self.yazi_bin = str(Path(self.yazi_bin).resolve())
+        self.ya_bin = str(Path(self.ya_bin).resolve())
+        self.powershell = str(Path(self.powershell).resolve())
         # Missing pinned dependency is a CI failure, not coverage silently skipped.
         import winpty  # noqa: F401
 
@@ -230,15 +248,18 @@ class WindowsIntegrationTest(unittest.TestCase):
         self.fixture("private", path=str(self.root), systemRights="FullControl")
         self.src, self.dst = self.root / "src", self.root / "dst"
         self.config, self.tmpdir = self.root / "config", self.root / "tmp"
-        for path in (self.src, self.dst, self.config, self.tmpdir, self.root / "home",
-                     self.root / "cache", self.root / "data", self.root / "state"):
-            path.mkdir()
+        home = self.root / "home"
+        cache, data = home / "AppData" / "Local", home / "AppData" / "Roaming"
+        # Windows known-folder APIs expand USERPROFILE and verify these paths;
+        # APPDATA/LOCALAPPDATA alone do not redirect Yazi's cache/state lookup.
+        for path in (self.src, self.dst, self.config, self.tmpdir, cache, data, self.root / "state"):
+            path.mkdir(parents=True, exist_ok=True)
         self.env = {key: value for key, value in os.environ.items()
                     if not key.upper().startswith(("YAZI_", "UCP_", "XDG_"))}
-        self.env.update(HOME=str(self.root / "home"), USERPROFILE=str(self.root / "home"),
-                        APPDATA=str(self.root / "data"), LOCALAPPDATA=str(self.root / "cache"),
-                        YAZI_CONFIG_HOME=str(self.config), XDG_CACHE_HOME=str(self.root / "cache"),
-                        XDG_STATE_HOME=str(self.root / "state"), XDG_DATA_HOME=str(self.root / "data"),
+        self.env.update(HOME=str(home), USERPROFILE=str(home),
+                        APPDATA=str(data), LOCALAPPDATA=str(cache),
+                        YAZI_CONFIG_HOME=str(self.config), XDG_CACHE_HOME=str(cache),
+                        XDG_STATE_HOME=str(self.root / "state"), XDG_DATA_HOME=str(data),
                         TEMP=str(self.tmpdir), TMP=str(self.tmpdir), TMPDIR=str(self.tmpdir),
                         TERM="xterm-256color", COLORTERM="truecolor", PYWINPTY_BACKEND="0",
                         UCP_PROBE=str(self.root / "probe"), UCP_DONE=str(self.root / "done"),

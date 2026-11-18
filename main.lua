@@ -3,6 +3,7 @@ Universal Copy/Paste for Yazi
 
     plugin ucp -- copy [notify]
     plugin ucp -- paste [notify]
+    plugin ucp doctor
 
 Native cuts use Yazi's paste command. Otherwise, external file URLs, images,
 and text take precedence over internal copied files. Unsupported clipboard
@@ -72,8 +73,10 @@ function M:entry(job)
 	elseif action == "paste" then
 		ya.dbg("Calling paste_entry")
 		return M:paste_entry(job)
+	elseif action == "doctor" then
+		return M:doctor_entry(job)
 	else
-		warn("Unknown action, requires copy or paste argument")
+		warn("Unknown action, requires copy, paste, or doctor")
 		return
 	end
 end
@@ -290,6 +293,152 @@ local function get_clipboard_mimetypes()
 	end
 end
 
+-- Doctor never requests clipboard payloads or creates diagnostic files.
+function M:doctor_entry(job)
+	local helpers = { "wl-copy", "wl-paste", "xclip", "osascript", "pbpaste", "realpath", "cp", "chmod", "mktemp" }
+	local available, lines = {}, { "ucp doctor (metadata only)" }
+	local function present(name)
+		local value = os.getenv(name)
+		return value ~= nil and value ~= ""
+	end
+	local wayland, x11 = present("WAYLAND_DISPLAY"), present("DISPLAY")
+	local session = wayland and (x11 and "wayland+x11" or "wayland") or (x11 and "x11" or "headless/unknown")
+	local ssh = present("SSH_CONNECTION") or present("SSH_CLIENT") or present("SSH_TTY")
+	local multiplexer = present("TMUX") or present("ZELLIJ")
+	lines[#lines + 1] = "Session: " .. session .. "; ssh=" .. (ssh and "yes" or "no")
+		.. "; multiplexer=" .. (multiplexer and "yes" or "no")
+	local yazi_version = command_output("yazi", { "--version" })
+	lines[#lines + 1] = "Yazi: " .. ((yazi_version or ""):match("Version:%s*(%d+%.%d+%.%d+)") or "unavailable")
+
+	-- command -v is a shell builtin; suppress its resolved executable paths.
+	-- Neither availability checks nor version probes invoke pbpaste/osascript.
+	for _, name in ipairs(helpers) do
+		available[name] = command_output("/bin/sh", {
+			"-c", 'if command -v "$1" >/dev/null 2>&1; then printf available; fi', "ucp-doctor", name,
+		}) == "available"
+	end
+	local versions = {
+		["wl-copy"] = { "--version", "^wl%-clipboard ([0-9]+%.[0-9][0-9%.]*)" },
+		["wl-paste"] = { "--version", "^wl%-clipboard ([0-9]+%.[0-9][0-9%.]*)" },
+		xclip = { "-version", "^xclip version ([0-9]+%.[0-9][0-9%.]*)" },
+		realpath = { "--version", "^realpath %(GNU coreutils%) ([0-9]+%.[0-9][0-9%.]*)" },
+		cp = { "--version", "^cp %(GNU coreutils%) ([0-9]+%.[0-9][0-9%.]*)" },
+		chmod = { "--version", "^chmod %(GNU coreutils%) ([0-9]+%.[0-9][0-9%.]*)" },
+		mktemp = { "--version", "^mktemp %(GNU coreutils%) ([0-9]+%.[0-9][0-9%.]*)" },
+	}
+	for _, name in ipairs(helpers) do
+		local status = "missing"
+		if available[name] then
+			status = "available (version not probed)"
+			local probe = versions[name]
+			if probe then
+				-- These flags exit before clipboard or filesystem operations; BSD
+				-- tools without --version reject the option. Never use bare mktemp.
+				local output = Command(name):arg({ probe[1] }):output()
+				local version
+				if output and output.status.success then
+					version = (output.stdout or ""):match(probe[2]) or (output.stderr or ""):match(probe[2])
+				end
+				status = version and ("available; version " .. version) or "available (version unavailable)"
+			end
+		end
+		lines[#lines + 1] = name .. ": " .. status
+	end
+
+	-- A successful empty response is distinct from a failed metadata request.
+	-- Keep the same preference as paste: Cocoa, then the Linux session order.
+	local content, backend
+	if available.osascript then
+		-- Enumerate raw type identifiers here: paste's MAC_TYPES intentionally
+		-- drops unknown types, which would hide their count in this report.
+		content = command_output("osascript", { "-l", "JavaScript", "-e", [[
+ObjC.import('AppKit');
+function run() {
+    var pb = $.NSPasteboard.generalPasteboard;
+    var types = pb.types;
+    if (!types) return '';
+    var result = [];
+    for (var i = 0; i < types.count; i++)
+        result.push(ObjC.unwrap(types.objectAtIndex(i)));
+    return result.join('\n');
+}
+]] })
+		if content ~= nil then
+			backend = "mac"
+		end
+	end
+	if not backend then
+		for _, candidate in ipairs(linux_backends()) do
+			if candidate == "wayland" and available["wl-paste"] then
+				content = command_output("wl-paste", { "--list-types" })
+			elseif candidate == "x11" and available.xclip then
+				content = command_output("xclip", { "-selection", "clipboard", "-o", "-t", "TARGETS" })
+			else
+				content = nil
+			end
+			if content ~= nil then
+				backend = candidate
+				break
+			end
+		end
+	end
+	local formats = {
+		"code/file-list", "text/uri-list", "text/plain", "UTF8_STRING", "TEXT", "STRING",
+		"image/png", "image/jpeg", "image/jpg", "image/tiff", "image/gif", "image/bmp",
+		"image/webp", "image/svg+xml", "image/avif",
+	}
+	local mac_formats = {
+		["public.file-url"] = "text/uri-list", NSFilenamesPboardType = "text/uri-list",
+		["public.png"] = "image/png", ["Apple PNG pasteboard type"] = "image/png",
+		["public.tiff"] = "image/tiff", ["NeXT TIFF v4.0 pasteboard type"] = "image/tiff",
+		["public.jpeg"] = "image/jpeg", ["com.compuserve.gif"] = "image/gif",
+		["public.utf8-plain-text"] = "text/plain", ["public.utf16-plain-text"] = "text/plain",
+		["public.utf16-external-plain-text"] = "text/plain", NSStringPboardType = "text/plain",
+	}
+	local allowed, found, unknown = {}, {}, 0
+	for _, format in ipairs(formats) do
+		allowed[format] = true
+	end
+	for mime in (content or ""):gmatch("[^\r\n]+") do
+		local format = mime:match("^text/plain;") and "text/plain" or mime
+		if backend == "mac" then
+			format = mac_formats[mime] or format
+		end
+		if allowed[format] then
+			found[format] = true
+		else
+			unknown = unknown + 1
+		end
+	end
+	local recognized = {}
+	for _, format in ipairs(formats) do
+		if found[format] then
+			recognized[#recognized + 1] = format
+		end
+	end
+	lines[#lines + 1] = "Clipboard backend: " .. (backend and (backend .. " (readable metadata)") or "unavailable (metadata probe failed or helpers missing)")
+	lines[#lines + 1] = "Formats: " .. (backend and (#recognized > 0 and table.concat(recognized, ", ") or "none recognized") or "unknown")
+	lines[#lines + 1] = "Unrecognized types: " .. (backend and tostring(unknown) or "unknown")
+	if not backend then
+		lines[#lines + 1] = "Check clipboard helper installation and session access; clipboard emptiness is unknown."
+	end
+	if wayland and (not available["wl-copy"] or not available["wl-paste"]) then
+		lines[#lines + 1] = "Wayland copy/paste needs wl-copy and wl-paste; xclip fallback needs X11 session access."
+	elseif x11 and not available.xclip then
+		lines[#lines + 1] = "X11 copy/paste needs xclip; install it or use an accessible Wayland/macOS backend."
+	end
+	if backend == "mac" and not available.pbpaste then
+		lines[#lines + 1] = "macOS plain-text paste needs pbpaste; file/image metadata can still be available."
+	end
+	if not available.realpath or not available.cp or not available.chmod or not available.mktemp then
+		lines[#lines + 1] = "File/image paste needs realpath, cp, chmod and mktemp; restore missing helpers on PATH."
+	end
+	lines[#lines + 1] = "Metadata only: no payload reads or clipboard writes; availability does not verify copying."
+	local report = table.concat(lines, "\n")
+	ya.notify({ title = PackageName .. " doctor", content = report, timeout = 30, level = "info" })
+	return report
+end
+
 local function read_clipboard(mime, backend)
 	if backend == "wayland" then
 		return command_output("wl-paste", { "--no-newline", "--type", mime })
@@ -343,22 +492,22 @@ local function get_clipboard_image_data(format, backend)
 	return data
 end
 
-function M:handle_image_paste(image_targets, no_hover, show_notify, backend)
+function M:handle_image_paste(image_targets, no_hover, backend)
 	local format = image_targets:match("image/svg%+xml") and "svg" or image_targets:match("image/([%w-]+)")
 	if backend == "mac" then
 		format = "png"
 	end
 	if not format then
 		warn("Could not determine clipboard image format")
-		return
+		return false
 	end
 	local data = get_clipboard_image_data(format, backend)
 	if not data or #data == 0 then
 		warn("Failed to get image data from clipboard")
-		return
+		return false
 	end
 	local file_name = string.format("pasted_%s.%s", os.date("%Y-%m-%d_%H-%M-%S"), format)
-	return M:save_file_with_conflict_handling(file_name, data, no_hover, show_notify)
+	return M:save_file_with_conflict_handling(file_name, data, no_hover)
 end
 
 --==============================================================================
@@ -866,13 +1015,15 @@ local function reveal_transfer(url, no_hover)
 	end
 end
 
-function M:handle_file_list_paste(file_uris, no_hover, show_notify)
+function M:handle_file_list_paste(file_uris, no_hover)
+	local outcome = { pasted = 0, skipped = 0, failed = 0, cancelled = false }
 	local cwd, root_err = destination_cwd()
 	if not cwd then
 		warn("%s", root_err)
-		return
+		outcome.failed = #file_uris
+		return outcome
 	end
-	local success_count, bulk_action = 0, nil
+	local bulk_action
 	for index, raw in ipairs(file_uris) do
 		local function paste_item()
 			local path, perr = absolute_path(raw)
@@ -946,22 +1097,20 @@ function M:handle_file_list_paste(file_uris, no_hover, show_notify)
 		end
 		local result, err = paste_item()
 		if result == "cancel_all" then
+			outcome.skipped = outcome.skipped + #file_uris - index + 1
+			outcome.cancelled = true
 			break
-		elseif result and result ~= "skip" then
-			success_count = success_count + 1
+		elseif result == "skip" then
+			outcome.skipped = outcome.skipped + 1
+		elseif result then
+			outcome.pasted = outcome.pasted + 1
 			reveal_transfer(result, no_hover)
-		elseif err then
+		else
+			outcome.failed = outcome.failed + 1
 			warn("Failed to paste item %d/%d: %s", index, #file_uris, err)
 		end
 	end
-	if success_count > 0 and show_notify then
-		ya.notify({
-			title = PackageName,
-			content = string.format("Successfully pasted %d file(s)", success_count),
-			timeout = 3,
-			level = "info",
-		})
-	end
+	return outcome
 end
 
 --==============================================================================
@@ -984,28 +1133,26 @@ local function input_file_name(default_name)
 	if input_event == 1 then
 		if not input_value or input_value == "" then
 			warn("File name can't be empty!")
-			return
+			return false
 		elseif input_value:match("/$") then
-			warn("File name can't ends with '/'")
-			return
+			warn("File name cannot end with '/'")
+			return false
 		end
 		return input_value
 	end
 end
 
 -- Handle text paste (text/plain mimetype) - suggest creating a new file
-function M:handle_text_paste(clipboard_content, no_hover, show_notify)
-	-- Prompt user for filename
+function M:handle_text_paste(clipboard_content, no_hover)
 	local file_name = input_file_name()
-	if not file_name or file_name == "" then
-		return
+	if not file_name then
+		return file_name -- nil: cancelled; false: invalid input
 	end
-
-	M:save_file_with_conflict_handling(file_name, clipboard_content, no_hover, show_notify)
+	return M:save_file_with_conflict_handling(file_name, clipboard_content, no_hover)
 end
 
 -- Text and image bytes share the same private staging/transaction path.
-function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hover, show_notify)
+function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hover)
 	local cwd, err = destination_cwd()
 	if not cwd then
 		warn("%s", err)
@@ -1036,7 +1183,6 @@ function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hov
 		return false
 	end
 	local action = "overwrite"
-	local notification = "Created: %s"
 	if cha then
 		local choices = {
 			{ on = "o", desc = "Overwrite", action = "overwrite" },
@@ -1050,7 +1196,7 @@ function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hov
 		local selected = ya.which({ cands = candidates })
 		action = selected and choices[selected].action or "cancel"
 		if action == "cancel" then
-			return false
+			return nil
 		elseif action == "copy" then
 			local copy, copy_err = copy_destination(target, "file")
 			if not copy then
@@ -1058,9 +1204,7 @@ function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hov
 				return false
 			end
 			target, cha = copy, nil
-			notification = "Created copy: %s"
 		else
-			notification = "Overwritten: %s"
 			local final, final_cha, final_err = file_target(target, target.name)
 			if not final then
 				warn("%s", final_err)
@@ -1092,14 +1236,6 @@ function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hov
 		return false
 	end
 	reveal_transfer(final, no_hover)
-	if show_notify then
-		ya.notify({
-			title = PackageName,
-			content = string.format(notification, final.name),
-			timeout = 3,
-			level = "info",
-		})
-	end
 	return true
 end
 
@@ -1120,6 +1256,42 @@ local yanked_info = ya.sync(function()
 
 	return paths, cx.yanked.is_cut
 end)
+
+local function single_paste_result(ok)
+	return {
+		pasted = ok == true and 1 or 0,
+		skipped = ok == nil and 1 or 0,
+		failed = ok == false and 1 or 0,
+		cancelled = ok == nil,
+	}
+end
+
+local function finish_paste(outcome, show_notify, original_yank)
+	if outcome.pasted > 0 and outcome.skipped == 0 and outcome.failed == 0 and not outcome.cancelled then
+		-- A prompt may outlive the original selection. Never clear a newer yank.
+		local current, is_cut = yanked_info()
+		local unchanged = not is_cut and #current == #original_yank
+		for i, path in ipairs(current) do
+			if path ~= original_yank[i] then
+				unchanged = false
+				break
+			end
+		end
+		if unchanged then
+			ya.emit("unyank", {})
+		end
+	end
+	if show_notify then
+		ya.notify({
+			title = PackageName,
+			content = string.format("%d pasted, %d skipped, %d failed%s",
+				outcome.pasted, outcome.skipped, outcome.failed, outcome.cancelled and " (cancelled)" or ""),
+			timeout = 5,
+			level = outcome.failed > 0 and "warn" or "info",
+		})
+	end
+	return outcome
+end
 
 -- Check if mimetypes array contains a mimetype that contains the substring
 local function has_mimetype(mimetypes, substring)
@@ -1144,7 +1316,6 @@ function M:paste_entry(job)
 	local yanked_files, is_cut = yanked_info()
 	if is_cut then
 		ya.emit("paste", {})
-		ya.emit("unyank", {})
 		return
 	end
 
@@ -1153,24 +1324,20 @@ function M:paste_entry(job)
 		if has_mimetype(mimetypes, "code/file-list") or has_mimetype(mimetypes, "text/uri-list") then
 			local paths = get_clipboard_file_uris(mimetypes, backend)
 			if paths then
-				M:handle_file_list_paste(paths, no_hover, show_notify)
-				ya.emit("unyank", {})
-				return
+				return finish_paste(M:handle_file_list_paste(paths, no_hover), show_notify, yanked_files)
 			end
 			-- A failed file representation may still have a usable image or text.
 		end
 		if has_mimetype(mimetypes, "image/") then
-			M:handle_image_paste(table.concat(mimetypes, "\n"), no_hover, show_notify, backend)
-			ya.emit("unyank", {})
-			return
+			return finish_paste(single_paste_result(
+				M:handle_image_paste(table.concat(mimetypes, "\n"), no_hover, backend)), show_notify, yanked_files)
 		end
 		for _, mime in ipairs(mimetypes) do
 			if mime:match("^text/plain") or mime == "UTF8_STRING" or mime == "TEXT" or mime == "STRING" then
 				local content = read_clipboard(backend == "mac" and "text/plain" or mime, backend)
 				if content and content ~= "" then
-					M:handle_text_paste(content, no_hover, show_notify)
-					ya.emit("unyank", {})
-					return
+					return finish_paste(single_paste_result(
+						M:handle_text_paste(content, no_hover)), show_notify, yanked_files)
 				end
 			end
 		end
@@ -1178,7 +1345,6 @@ function M:paste_entry(job)
 
 	if #yanked_files > 0 then
 		ya.emit("paste", {})
-		ya.emit("unyank", {})
 		return
 	end
 	warn("Clipboard does not contain readable supported data")

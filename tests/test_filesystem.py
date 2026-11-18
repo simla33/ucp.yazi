@@ -3,7 +3,7 @@ import os
 import shutil
 import subprocess
 
-from support.integration import IntegrationTest, REPO, tree
+from support.integration import IntegrationTest, REPO, eventually, tree
 
 
 class FilesystemSafety(IntegrationTest):
@@ -177,6 +177,7 @@ class FilesystemSafety(IntegrationTest):
         before = tree(self.dst)
         try:
             self.paste([source], b"o")
+            self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"0\0" b"1\0false")
             
             self.assertEqual(tree(self.dst), before)
             self.no_staging()
@@ -192,6 +193,7 @@ class FilesystemSafety(IntegrationTest):
         self.dst.chmod(0o500)
         try:
             self.paste([source], b"o")
+            self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"0\0" b"1\0false")
             
             self.assertEqual(tree(self.dst), before)
             self.no_staging()
@@ -218,6 +220,7 @@ class FilesystemSafety(IntegrationTest):
         self.env.update(LD_PRELOAD=str(library), UCP_FAIL_RENAME_TO=str(self.dst / "d"), UCP_FAIL_RENAME_MARKER=str(marker))
         self.paste([source], b"o")
         self.assertTrue(marker.exists(), "fault boundary was not exercised")
+        self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"0\0" b"1\0false")
         
         self.assertEqual(tree(self.dst), original)
         self.assertEqual((source / "incoming").read_bytes(), b"new tree")
@@ -294,9 +297,11 @@ class FilesystemSafety(IntegrationTest):
         os.symlink(self.dst, alias)
         self.write(self.dst / "keep", b"root sentinel")
         source = self.write(self.src / "a", b"must not write through root")
+        second = self.write(self.src / "b", b"also must not write through root")
         before = tree(self.dst)
         self.start(alias)
-        self.paste([source])
+        self.paste([source, second])
+        self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"0\0" b"2\0false")
         
         self.assertEqual(tree(self.dst), before)
         self.no_staging()
@@ -445,6 +450,8 @@ def collision_case(directory, key):
             self.write(self.dst / "a", b"old")
         old = tree(self.dst)
         self.paste([source], key)
+        expected = b"0\0" b"1\0" b"0\0false" if key in (b"q", b"\x1b") else b"1\0" b"0\0" b"0\0false"
+        self.assertEqual((self.root / "result").read_bytes(), expected)
         if key in (b"q", b"\x1b"):
             self.assertEqual(tree(self.dst), old)
         elif key == b"c":
@@ -466,7 +473,8 @@ for _directory in (False, True):
 
 
 class BulkCollisionMenus(IntegrationTest):
-    def _bulk(self, key, directories_first):
+    def _bulk(self, key, directories_first, paste_first=False):
+        native = self.write(self.root / "native-selection" / "native", b"native selection survives cancel all")
         f = self.write(self.src / "file.txt", b"new file")
         d = self.src / "dir"
         self.write(d / "new", b"new directory")
@@ -476,9 +484,24 @@ class BulkCollisionMenus(IntegrationTest):
         later = self.write(self.src / "later", b"must not arrive after Q")
         before = tree(self.dst)
         paths = [d, f, later] if directories_first else [f, d, later]
+        early = self.write(self.src / "early", b"copied before cancel all") if paste_first else None
+        if early:
+            paths.insert(0, early)
+        self.start(native.parent)
+        self.yank()
+        self.cd(self.dst)
         self.paste(paths, key)
         if key == b"Q":
-            self.assertEqual(tree(self.dst), before)
+            self.assertEqual((self.root / "result").read_bytes(),
+                             ("%d\0%d\0%d\0true" % (int(paste_first), 3, 0)).encode())
+            expected = before.copy()
+            if early:
+                expected[early.name] = tree(self.src)[early.name]
+            self.assertEqual(tree(self.dst), expected)
+            self.state(lambda s: int(s[3]) == 1, "cancel all erased native yank")
+            self.emit("paste")
+            eventually(lambda: (self.dst / native.name).exists(), "native paste after cancel all did not copy")
+            self.assertEqual((self.dst / native.name).read_bytes(), native.read_bytes())
         elif key == b"O":
             self.assertEqual((self.dst / "file.txt").read_bytes(), b"new file")
             self.assertEqual(tree(self.dst / "dir"), tree(d))
@@ -488,7 +511,18 @@ class BulkCollisionMenus(IntegrationTest):
             self.assertEqual((self.dst / "file_copy.txt").read_bytes(), b"new file")
             self.assertEqual(tree(self.dst / "dir"), before["dir"][2])
             self.assertEqual(tree(self.dst / "dir_copy"), tree(d))
+            self.assertEqual((self.dst / "later").read_bytes(), later.read_bytes())
+        if key != b"Q":
+            self.assertEqual((self.root / "result").read_bytes(),
+                             ("%d\0%d\0%d\0false" % (len(paths), 0, 0)).encode())
+            self.state(lambda s: int(s[3]) == 0, "successful bulk paste retained stale native yank")
         self.no_staging()
+
+    def test_cancel_all_after_success_counts_current_and_remaining_files(self):
+        self._bulk(b"Q", directories_first=False, paste_first=True)
+
+    def test_cancel_all_after_success_counts_current_and_remaining_directories(self):
+        self._bulk(b"Q", directories_first=True, paste_first=True)
 
 
 for _key in (b"O", b"C", b"Q"):

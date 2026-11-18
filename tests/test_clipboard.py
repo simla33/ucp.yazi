@@ -117,6 +117,8 @@ class ClipboardTransfers(IntegrationTest):
         self.start()
         self.begin()
         self.finish()
+        self.assertEqual((self.root / "result").read_bytes(),
+                         ("%d\0%d\0%d\0false" % (len(paths), 0, 0)).encode())
         self.assertEqual(tree(self.dst), before)
         self.assertEqual(tree(self.src), before)
         self.no_staging()
@@ -132,9 +134,59 @@ class ClipboardTransfers(IntegrationTest):
         self.cd(self.dst)
         self.begin()
         self.finish()
+        self.assertEqual((self.root / "result").read_bytes(), b"1\0" b"0\0" b"0\0false")
+        self.state(lambda s: int(s[3]) == 0, "successful external paste retained stale native yank")
         self.assertEqual((self.dst / "external").read_bytes(), b"external clipboard")
         self.assertFalse((self.dst / "internal").exists())
         self.assertEqual(internal.read_bytes(), b"internal selection")
+        self.no_staging()
+
+    def test_external_file_failure_preserves_native_yank(self):
+        native = self.write(self.src / "native", b"native selection survives failure")
+        missing = self.root / "missing-external"
+        self.files_clip([missing])
+        self.start(self.src)
+        self.yank()
+        self.cd(self.dst)
+        self.begin()
+        self.finish()
+        self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"0\0" b"1\0false")
+        self.assertEqual(tree(self.dst), {})
+        self.state(lambda s: int(s[3]) == 1, "failed external paste erased native yank")
+        self.emit("paste")
+        eventually(lambda: (self.dst / native.name).exists(), "native paste after external failure did not copy")
+        self.assertEqual((self.dst / native.name).read_bytes(), native.read_bytes())
+        self.no_staging()
+
+    def test_mixed_external_batch_counts_top_level_entries_and_preserves_native_yank(self):
+        native = self.write(self.src / "native", b"native selection survives partial paste")
+        external = self.root / "external"
+        directory = external / "bundle"
+        self.write(directory / "one", b"first nested file")
+        self.write(directory / "nested" / "two", b"second nested file")
+        (directory / "empty").mkdir()
+        skipped = self.write(external / "collision", b"must be skipped")
+        self.write(self.dst / skipped.name, b"original destination")
+        missing = external / "missing"
+        last = self.write(external / "last", b"continues after skip and failure")
+        before = tree(external)
+        self.files_clip([directory, skipped, missing, last])
+        self.start(self.src)
+        self.yank()
+        self.cd(self.dst)
+        self.begin()
+        self.menu(b"q")
+        self.finish()
+        self.assertEqual((self.root / "result").read_bytes(), b"2\0" b"1\0" b"1\0false")
+        self.assertEqual(set(p.name for p in self.dst.iterdir()), {"bundle", "collision", "last"})
+        self.assertEqual(tree(self.dst / directory.name), tree(directory))
+        self.assertEqual((self.dst / skipped.name).read_bytes(), b"original destination")
+        self.assertEqual((self.dst / last.name).read_bytes(), last.read_bytes())
+        self.assertEqual(tree(external), before)
+        self.state(lambda s: int(s[3]) == 1, "partial external paste erased native yank")
+        self.emit("paste")
+        eventually(lambda: (self.dst / native.name).exists(), "native paste after partial external paste did not copy")
+        self.assertEqual((self.dst / native.name).read_bytes(), native.read_bytes())
         self.no_staging()
 
     def test_native_cut_wins_over_usable_external_clipboard(self):
@@ -222,6 +274,7 @@ class ClipboardSaves(IntegrationTest):
 
     def test_text_new_file_bytes(self):
         self.text_input("note.txt")
+        self.assertEqual((self.root / "result").read_bytes(), b"1\0" b"0\0" b"0\0false")
         self.assertEqual((self.dst / "note.txt").read_bytes(), b"new clipboard text\nUnicode: \xe6\x96\x87\n")
         self.no_staging()
 
@@ -229,6 +282,7 @@ class ClipboardSaves(IntegrationTest):
         self.write(self.dst / "note.txt", b"original")
         self.write(self.dst / "note_copy.txt", b"earlier copy")
         self.text_input("note.txt", b"c")
+        self.assertEqual((self.root / "result").read_bytes(), b"1\0" b"0\0" b"0\0false")
         self.assertEqual((self.dst / "note.txt").read_bytes(), b"original")
         self.assertEqual((self.dst / "note_copy.txt").read_bytes(), b"earlier copy")
         self.assertEqual((self.dst / "note_copy_1.txt").read_bytes(), b"new clipboard text\nUnicode: \xe6\x96\x87\n")
@@ -237,12 +291,16 @@ class ClipboardSaves(IntegrationTest):
     def test_text_overwrite_conflict(self):
         self.write(self.dst / "note.txt", b"original")
         self.text_input("note.txt", b"o")
+        self.assertEqual((self.root / "result").read_bytes(), b"1\0" b"0\0" b"0\0false")
         self.assertEqual((self.dst / "note.txt").read_bytes(), b"new clipboard text\nUnicode: \xe6\x96\x87\n")
         self.no_staging()
 
-    def test_text_cancel_at_filename_writes_nothing(self):
+    def test_text_cancel_at_filename_preserves_native_yank_and_writes_nothing(self):
+        native = self.write(self.src / "native", b"native selection survives filename cancellation")
         self.clip(b"discard this text", "text/plain")
-        self.start()
+        self.start(self.src)
+        self.yank()
+        self.cd(self.dst)
         self.begin()
         self.yazi.wait(b"Enter file name", self.offset)
         # Yazi's input is modal: Ctrl-C always closes, unlike a first Escape
@@ -251,11 +309,19 @@ class ClipboardSaves(IntegrationTest):
         self.finish()
         self.assertEqual(tree(self.dst), {})
         self.no_staging()
+        self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"1\0" b"0\0true")
+        self.state(lambda s: int(s[3]) == 1, "filename cancellation erased native yank")
+        self.emit("paste")
+        eventually(lambda: (self.dst / native.name).exists(), "native paste after filename cancellation did not copy")
+        self.assertEqual((self.dst / native.name).read_bytes(), native.read_bytes())
+        self.assertEqual(set(p.name for p in self.dst.iterdir()), {native.name})
+        self.no_staging()
 
     def test_text_escape_at_conflict_writes_nothing(self):
         self.write(self.dst / "note.txt", b"original")
         before = tree(self.dst)
         self.text_input("note.txt", b"\x1b")
+        self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"1\0" b"0\0true")
         self.assertEqual(tree(self.dst), before)
         self.no_staging()
 
@@ -263,6 +329,7 @@ class ClipboardSaves(IntegrationTest):
         self.write(self.dst / "note.txt", b"original")
         before = tree(self.dst)
         self.text_input("note.txt", b"q")
+        self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"1\0" b"0\0true")
         self.assertEqual(tree(self.dst), before)
         self.no_staging()
 
@@ -276,6 +343,7 @@ class ClipboardSaves(IntegrationTest):
         self.assertEqual(sentinel.read_bytes(), b"outside sentinel")
         self.assertEqual(tree(self.dst), before)
         self.no_staging()
+        self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"0\0" b"1\0false")
 
     def test_text_dot_path_cannot_overwrite_parent_sentinel(self):
         sentinel = self.write(self.root / "escape", b"parent sentinel")
@@ -284,6 +352,7 @@ class ClipboardSaves(IntegrationTest):
         self.assertEqual(sentinel.read_bytes(), b"parent sentinel")
         self.assertEqual(tree(self.dst), {})
         self.no_staging()
+        self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"0\0" b"1\0false")
 
     def test_png_clipboard_bytes(self):
         self.clip(PNG, "image/png")
@@ -292,11 +361,31 @@ class ClipboardSaves(IntegrationTest):
         self.finish()
         images = list(self.dst.glob("pasted_*.png"))
         self.assertEqual(len(images), 1)
+        self.assertEqual((self.root / "result").read_bytes(), b"1\0" b"0\0" b"0\0false")
         self.assertEqual(images[0].read_bytes(), PNG)
         self.assertEqual(images[0].read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
         self.no_staging()
 
+    def test_png_empty_clipboard_read_preserves_native_yank(self):
+        native = self.write(self.src / "native", b"native selection survives empty image data")
+        # A real X11 owner advertises image/png but supplies no readable image
+        # bytes. This exercises the read-failure path without replacing helpers.
+        self.clip(b"", "image/png")
+        self.start(self.src)
+        self.yank()
+        self.cd(self.dst)
+        self.begin()
+        self.finish()
+        self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"0\0" b"1\0false")
+        self.assertEqual(tree(self.dst), {})
+        self.state(lambda s: int(s[3]) == 1, "image read failure erased native yank")
+        self.emit("paste")
+        eventually(lambda: (self.dst / native.name).exists(), "native paste after image read failure did not copy")
+        self.assertEqual((self.dst / native.name).read_bytes(), native.read_bytes())
+        self.no_staging()
+
     def _image_conflict(self, action):
+        native = self.write(self.src / "native", b"native selection survives image cancellation")
         self.clip(PNG, "image/png")
         # Reserve every timestamp in the next two minutes *before* invoking
         # the real image path. No race against os.date's one-second boundary.
@@ -306,19 +395,29 @@ class ClipboardSaves(IntegrationTest):
             self.write(self.dst / ("pasted_%s.png" % stamp), b"original image sentinel")
             self.write(self.dst / ("pasted_%s_copy.png" % stamp), b"earlier image copy sentinel")
         before = tree(self.dst)
-        self.start()
+        self.start(self.src)
+        self.yank()
+        self.cd(self.dst)
         self.begin()
         self.menu(action)
         self.finish()
+        if action != b"c":
+            self.assertEqual((self.root / "result").read_bytes(), b"0\0" b"1\0" b"0\0true")
         for name, value in before.items():
             self.assertEqual((self.dst / name).read_bytes(), value[1], "image conflict overwrote an existing file")
         copies = [self.dst / name for name in set(tree(self.dst)) - set(before)]
         if action == b"c":
+            self.assertEqual((self.root / "result").read_bytes(), b"1\0" b"0\0" b"0\0false")
+            self.state(lambda s: int(s[3]) == 0, "successful image save retained stale native yank")
             self.assertEqual(len(copies), 1)
             self.assertTrue(copies[0].name.endswith("_copy_1.png"))
             self.assertEqual(copies[0].read_bytes(), PNG)
         else:
             self.assertEqual(tree(self.dst), before)
+            self.state(lambda s: int(s[3]) == 1, "image cancellation erased native yank")
+            self.emit("paste")
+            eventually(lambda: (self.dst / native.name).exists(), "native paste after image cancellation did not copy")
+            self.assertEqual((self.dst / native.name).read_bytes(), native.read_bytes())
         self.no_staging()
 
     def test_png_unique_copy_conflict(self):

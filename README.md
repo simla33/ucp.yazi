@@ -13,6 +13,9 @@ Integrates yazi copy/paste with system clipboard similar to GUI file managers.
 
 - Native Yazi cuts retain priority over external clipboard contents.
 - When no supported clipboard data is readable, copied files fall back to native Yazi paste.
+- Cancelled, skipped, failed, or partially completed external pastes retain the native yank.
+- Paste notifications report pasted, skipped, and failed top-level items, including unprocessed items after cancelling a batch.
+- **Clipboard diagnostics** - `plugin ucp doctor` checks the environment without reading clipboard contents.
 
 
 ## Previews
@@ -67,6 +70,25 @@ prepend_keymap = [
     { on = "y", run = "plugin ucp -- copy notify", desc = "Copy" }
 ]
 ```
+
+### Diagnostics
+
+Bind a key to the read-only diagnostic command:
+
+```toml
+[[mgr.prepend_keymap]]
+on = ["c", "d"]
+run = "plugin ucp doctor"
+desc = "Diagnose clipboard integration"
+```
+
+The report shows helper availability, recognized versions, session/backend information, and supported clipboard formats. It does not read clipboard payloads, change clipboard ownership, or include file paths, environment values, or unknown format names. The report stays visible for 30 seconds; review it before sharing. A backend probe failure means **unavailable or unreadable**, not necessarily an empty clipboard.
+
+### Paste results
+
+With `notify`, external paste reports **pasted, skipped, and failed** counts. A directory counts as one top-level item, not each nested file. `Q` marks the current and remaining batch items skipped and labels the summary cancelled. Earlier completed items remain in place.
+
+Cancelling a filename prompt or collision, skipping any item, or encountering a failure preserves the native yank. Only a fully successful external paste clears the unchanged original yank. Native copy/cut fallbacks are delegated to Yazi, which owns their completion and yank lifecycle. To paste a retained yank instead of external clipboard contents, use Yazi's built-in `paste` action.
 
 ## Paste behavior and safety
 

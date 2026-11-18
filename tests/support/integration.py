@@ -98,7 +98,13 @@ function M:entry(job)
         ya.emit("toggle", {file, state = "on"})
         return
     end
-    ucp:entry(job)
+    local result = ucp:entry(job)
+    if type(result) == "table" then
+        result = table.concat({result.pasted, result.skipped, result.failed, tostring(result.cancelled)}, "\0")
+    end
+    if type(result) == "string" then
+        assert(fs.write(Url(os.getenv("UCP_RESULT")), result))
+    end
     assert(fs.write(Url(os.getenv("UCP_DONE")), action))
 end
 return M
@@ -224,6 +230,7 @@ class IntegrationTest(unittest.TestCase):
             TERM="xterm-256color", COLORTERM="truecolor", SHELL="/bin/sh",
             PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
             UCP_PROBE=str(self.root / "probe"), UCP_DONE=str(self.root / "done"),
+            UCP_RESULT=str(self.root / "result"),
         )
         self.done = self.root / "done"
         self.probe_file = self.root / "probe"
@@ -402,6 +409,7 @@ prepend_keymap = [
 
     def begin(self, action="paste"):
         self.done.unlink(missing_ok=True)
+        (self.root / "result").unlink(missing_ok=True)
         self.offset = self.yazi.mark()
         self.yazi.send(b"p" if action == "paste" else b"y")
 

@@ -13,6 +13,7 @@ staging/recovery guarantees, platform requirements, and verification limits.
 local M = {}
 local PackageName = "ucp"
 local windows = ya.target_os() == "windows" and require("ucp.windows") or nil
+local portal = ya.target_os() == "linux" and require("ucp.portal") or nil
 
 --==============================================================================
 -- Helpers BEGIN
@@ -219,6 +220,9 @@ function M:copy_entry(job)
 		end
 		local content = table.concat(uris, "\r\n") .. "\r\n"
 		status, err = command_input("osascript", { "-l", "JavaScript", "-e", MAC_COPY }, content)
+		if (not status or not status.success) and portal then
+			status, err = portal.copy(content)
+		end
 		if not status or not status.success then
 			for _, backend in ipairs(linux_backends()) do
 				if backend == "wayland" then

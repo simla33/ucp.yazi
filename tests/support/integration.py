@@ -191,6 +191,7 @@ class IntegrationTest(unittest.TestCase):
             PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
             UCP_PROBE=str(self.root / "probe"), UCP_DONE=str(self.root / "done"),
             UCP_RESULT=str(self.root / "result"),
+            DBUS_SESSION_BUS_ADDRESS="unix:path=" + str(self.root / "no-session-bus"),
         )
         self.done = self.root / "done"
         self.probe_file = self.root / "probe"

@@ -15,7 +15,8 @@ PROBE_TIMEOUT = 2
 HELPERS = ("wl-copy", "wl-paste", "xclip", "osascript", "pbpaste",
            "realpath", "cp", "chmod", "mktemp")
 FORMATS = (
-    "code/file-list", "text/uri-list", "text/plain", "UTF8_STRING", "TEXT", "STRING",
+    "code/file-list", "text/uri-list", "application/vnd.portal.filetransfer",
+    "text/plain", "UTF8_STRING", "TEXT", "STRING",
     "image/png", "image/jpeg", "image/jpg", "image/tiff", "image/gif", "image/bmp",
     "image/webp", "image/svg+xml", "image/avif",
 )

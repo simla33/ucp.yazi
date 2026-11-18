@@ -3,7 +3,7 @@
 The suite requires Linux with real ``yazi``, ``ya``, ``bwrap`` (bubblewrap),
 ``Xvfb`` and ``xclip``. ``realpath``, ``mktemp``, ``chmod`` and ``cp`` must
 also be available inside the read-only host bind. A C compiler is optional:
-only the one-shot libc-rename failure injection case needs it.
+the native rename-failure and process-interruption cases require it.
 """
 
 import shutil

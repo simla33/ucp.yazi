@@ -1,6 +1,7 @@
 """Consumer-visible safety, transactional copying and collision-menu regressions."""
 import os
 import shutil
+import signal
 import subprocess
 
 from support.integration import IntegrationTest, REPO, eventually, tree
@@ -224,6 +225,73 @@ class FilesystemSafety(IntegrationTest):
         
         self.assertEqual(tree(self.dst), original)
         self.assertEqual((source / "incoming").read_bytes(), b"new tree")
+        self.no_staging()
+
+    def test_interrupted_install_retains_backup_for_manual_recovery(self):
+        cc = shutil.which("cc")
+        if not cc:
+            self.skipTest("optional staged-install interruption test requires a C compiler")
+        library = self.root / "rename-crash.so"
+        built = subprocess.run(self.sandbox([
+            cc, "-shared", "-fPIC", "-O2", "-o", library,
+            REPO / "tests" / "fixtures" / "rename_crash.c", "-ldl",
+        ]), env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(built.returncode, 0, built.stderr.decode(errors="replace"))
+        source = self.src / "d"
+        target = self.dst / "d"
+        new_bytes = b"prepared replacement\x00\xff\n"
+        old_bytes = b"original target\x00\xfe\n"
+        self.write(source / "incoming", new_bytes, mode=0o600)
+        (source / "empty").mkdir()
+        self.write(target / "keep", old_bytes, mode=0o600)
+        source.chmod(0o700)
+        target.chmod(0o700)
+        original_source, original_destination = tree(self.src), tree(self.dst)
+        marker = self.root / "rename-crash-fired"
+        self.env.update(
+            LD_PRELOAD=str(library),
+            UCP_CRASH_RENAME_TO=str(target),
+            UCP_CRASH_RENAME_MARKER=str(marker),
+        )
+        self.files_clip([source])
+        self.start()
+        self.begin()
+        self.menu(b"o")
+        # Do not call finish(): SIGKILL prevents any Lua result or rollback.
+        # bwrap relays its sandbox child's signal as a shell-style exit code.
+        self.assertEqual(self.yazi.process.wait(timeout=12), 128 + signal.SIGKILL)
+        self.assertTrue(marker.exists(), "staged-install boundary was not reached")
+        stages = list(self.dst.glob(".ucp-stage*"))
+        self.assertEqual(len(stages), 1)
+        stage = stages[0]
+        backup, payload = stage / "backup", stage / "payload"
+        self.assertEqual(marker.read_bytes().split(b"\0"), [
+            os.fsencode(os.path.realpath(shutil.which("yazi"))),
+            os.fsencode(payload), os.fsencode(target),
+        ], "interruption must originate in actual Yazi at payload -> target")
+        self.assertFalse(os.path.lexists(target), "interrupted target must be absent")
+        self.assertFalse(self.done.exists())
+        self.assertFalse((self.root / "result").exists())
+        self.assertEqual({p.name for p in self.dst.iterdir()}, {stage.name})
+        self.assertEqual({p.name for p in stage.iterdir()}, {"backup", "payload"})
+        self.assertEqual(stage.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(tree(backup), original_destination["d"][2])
+        self.assertEqual(tree(payload), original_source["d"][2])
+        self.assertEqual((backup / "keep").read_bytes(), old_bytes)
+        self.assertEqual((payload / "incoming").read_bytes(), new_bytes)
+        self.assertEqual((source / "incoming").read_bytes(), new_bytes)
+        self.assertEqual(tree(self.src), original_source)
+
+        # Explicit user-directed recovery after Yazi has exited: restore only
+        # the known old backup, then discard the verified prepared replacement.
+        # No automatic restart recovery or power-loss durability is implied.
+        backup.rename(target)
+        self.assertEqual(tree(target), original_destination["d"][2])
+        self.assertEqual((target / "keep").read_bytes(), old_bytes)
+        self.assertEqual(tree(payload), original_source["d"][2])
+        shutil.rmtree(stage)
+        self.assertEqual(tree(self.dst), original_destination)
+        self.assertEqual(tree(self.src), original_source)
         self.no_staging()
 
     def test_same_file_is_rejected_without_rewriting(self):

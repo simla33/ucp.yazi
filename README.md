@@ -145,7 +145,7 @@ $env:UCP_WINDOWS_TESTS = '1'
 python -m unittest discover -s tests -p test_windows_native.py -v
 ```
 
-These opt-in tests replace the desktop clipboard with synthetic data; do not enable them on your daily desktop. Ordinary discovery skips them. The repository's Native Windows workflow provisions a dedicated hosted runner.
+These opt-in tests replace the desktop clipboard with synthetic data; do not enable them on your daily desktop. Ordinary discovery skips them. Use a disposable Windows desktop or Windows VM, including a Docker-managed KVM guest—not a normal Linux container.
 
 ## Credits
 

@@ -3,7 +3,6 @@ Universal Copy/Paste for Yazi
 
     plugin ucp -- copy [notify]
     plugin ucp -- paste [notify]
-    plugin ucp doctor
 
 Native cuts use Yazi's paste command. Otherwise, external file URLs, images,
 and text take precedence over internal copied files. Unsupported clipboard
@@ -13,6 +12,7 @@ staging/recovery guarantees, platform requirements, and verification limits.
 
 local M = {}
 local PackageName = "ucp"
+local windows = ya.target_os() == "windows" and require("ucp.windows") or nil
 
 --==============================================================================
 -- Helpers BEGIN
@@ -73,10 +73,8 @@ function M:entry(job)
 	elseif action == "paste" then
 		ya.dbg("Calling paste_entry")
 		return M:paste_entry(job)
-	elseif action == "doctor" then
-		return M:doctor_entry(job)
 	else
-		warn("Unknown action, requires copy, paste, or doctor")
+		warn("Unknown action, requires copy or paste")
 		return
 	end
 end
@@ -195,23 +193,30 @@ function M:copy_entry(job)
 		return
 	end
 
-	local uris = {}
-	for _, path in ipairs(paths) do
-		uris[#uris + 1] = "file://" .. path:gsub("([^A-Za-z0-9%-%._~/])", function(c)
-			return string.format("%%%02X", c:byte())
-		end)
-	end
-	local content = table.concat(uris, "\r\n") .. "\r\n"
-	local status, err = command_input("osascript", { "-l", "JavaScript", "-e", MAC_COPY }, content)
-	if not status or not status.success then
-		for _, backend in ipairs(linux_backends()) do
-			if backend == "wayland" then
-				status, err = command_input("wl-copy", { "--type", "text/uri-list" }, content)
-			else
-				status, err = command_input("xclip", { "-selection", "clipboard", "-t", "text/uri-list" }, content)
-			end
-			if status and status.success then
-				break
+	local status, err
+	if windows then
+		local result
+		result, err = windows.run("copy", { paths = paths })
+		status = { success = result ~= nil }
+	else
+		local uris = {}
+		for _, path in ipairs(paths) do
+			uris[#uris + 1] = "file://" .. path:gsub("([^A-Za-z0-9%-%._~/])", function(c)
+				return string.format("%%%02X", c:byte())
+			end)
+		end
+		local content = table.concat(uris, "\r\n") .. "\r\n"
+		status, err = command_input("osascript", { "-l", "JavaScript", "-e", MAC_COPY }, content)
+		if not status or not status.success then
+			for _, backend in ipairs(linux_backends()) do
+				if backend == "wayland" then
+					status, err = command_input("wl-copy", { "--type", "text/uri-list" }, content)
+				else
+					status, err = command_input("xclip", { "-selection", "clipboard", "-t", "text/uri-list" }, content)
+				end
+				if status and status.success then
+					break
+				end
 			end
 		end
 	end
@@ -279,6 +284,9 @@ local function mime_lines(content)
 end
 
 local function get_clipboard_mimetypes()
+	if windows then
+		return mime_lines(windows.run("types", {})), "windows"
+	end
 	local types = mime_lines(command_output("osascript", { "-l", "JavaScript", "-e", MAC_TYPES }))
 	if types then
 		return types, "mac"
@@ -297,154 +305,10 @@ local function get_clipboard_mimetypes()
 	end
 end
 
--- Doctor never requests clipboard payloads or creates diagnostic files.
-function M:doctor_entry(job)
-	local helpers = { "wl-copy", "wl-paste", "xclip", "osascript", "pbpaste", "realpath", "cp", "chmod", "mktemp" }
-	local available, lines = {}, { "ucp doctor (metadata only)" }
-	local function present(name)
-		local value = os.getenv(name)
-		return value ~= nil and value ~= ""
-	end
-	local wayland, x11 = present("WAYLAND_DISPLAY"), present("DISPLAY")
-	local session = wayland and (x11 and "wayland+x11" or "wayland") or (x11 and "x11" or "headless/unknown")
-	local ssh = present("SSH_CONNECTION") or present("SSH_CLIENT") or present("SSH_TTY")
-	local multiplexer = present("TMUX") or present("ZELLIJ")
-	lines[#lines + 1] = "Session: " .. session .. "; ssh=" .. (ssh and "yes" or "no")
-		.. "; multiplexer=" .. (multiplexer and "yes" or "no")
-	local yazi_version = command_output("yazi", { "--version" })
-	lines[#lines + 1] = "Yazi: " .. ((yazi_version or ""):match("Version:%s*(%d+%.%d+%.%d+)") or "unavailable")
-
-	-- command -v is a shell builtin; suppress its resolved executable paths.
-	-- Neither availability checks nor version probes invoke pbpaste/osascript.
-	for _, name in ipairs(helpers) do
-		available[name] = command_output("/bin/sh", {
-			"-c", 'if command -v "$1" >/dev/null 2>&1; then printf available; fi', "ucp-doctor", name,
-		}) == "available"
-	end
-	local versions = {
-		["wl-copy"] = { "--version", "^wl%-clipboard ([0-9]+%.[0-9][0-9%.]*)" },
-		["wl-paste"] = { "--version", "^wl%-clipboard ([0-9]+%.[0-9][0-9%.]*)" },
-		xclip = { "-version", "^xclip version ([0-9]+%.[0-9][0-9%.]*)" },
-		realpath = { "--version", "^realpath %(GNU coreutils%) ([0-9]+%.[0-9][0-9%.]*)" },
-		cp = { "--version", "^cp %(GNU coreutils%) ([0-9]+%.[0-9][0-9%.]*)" },
-		chmod = { "--version", "^chmod %(GNU coreutils%) ([0-9]+%.[0-9][0-9%.]*)" },
-		mktemp = { "--version", "^mktemp %(GNU coreutils%) ([0-9]+%.[0-9][0-9%.]*)" },
-	}
-	for _, name in ipairs(helpers) do
-		local status = "missing"
-		if available[name] then
-			status = "available (version not probed)"
-			local probe = versions[name]
-			if probe then
-				-- These flags exit before clipboard or filesystem operations; BSD
-				-- tools without --version reject the option. Never use bare mktemp.
-				local output = Command(name):arg({ probe[1] }):output()
-				local version
-				if output and output.status.success then
-					version = (output.stdout or ""):match(probe[2]) or (output.stderr or ""):match(probe[2])
-				end
-				status = version and ("available; version " .. version) or "available (version unavailable)"
-			end
-		end
-		lines[#lines + 1] = name .. ": " .. status
-	end
-
-	-- A successful empty response is distinct from a failed metadata request.
-	-- Keep the same preference as paste: Cocoa, then the Linux session order.
-	local content, backend
-	if available.osascript then
-		-- Enumerate raw type identifiers here: paste's MAC_TYPES intentionally
-		-- drops unknown types, which would hide their count in this report.
-		content = command_output("osascript", { "-l", "JavaScript", "-e", [[
-ObjC.import('AppKit');
-function run() {
-    var pb = $.NSPasteboard.generalPasteboard;
-    var types = pb.types;
-    if (!types) return '';
-    var result = [];
-    for (var i = 0; i < types.count; i++)
-        result.push(ObjC.unwrap(types.objectAtIndex(i)));
-    return result.join('\n');
-}
-]] })
-		if content ~= nil then
-			backend = "mac"
-		end
-	end
-	if not backend then
-		for _, candidate in ipairs(linux_backends()) do
-			if candidate == "wayland" and available["wl-paste"] then
-				content = command_output("wl-paste", { "--list-types" })
-			elseif candidate == "x11" and available.xclip then
-				content = command_output("xclip", { "-selection", "clipboard", "-o", "-t", "TARGETS" })
-			else
-				content = nil
-			end
-			if content ~= nil then
-				backend = candidate
-				break
-			end
-		end
-	end
-	local formats = {
-		"code/file-list", "text/uri-list", "text/plain", "UTF8_STRING", "TEXT", "STRING",
-		"image/png", "image/jpeg", "image/jpg", "image/tiff", "image/gif", "image/bmp",
-		"image/webp", "image/svg+xml", "image/avif",
-	}
-	local mac_formats = {
-		["public.file-url"] = "text/uri-list", NSFilenamesPboardType = "text/uri-list",
-		["public.png"] = "image/png", ["Apple PNG pasteboard type"] = "image/png",
-		["public.tiff"] = "image/tiff", ["NeXT TIFF v4.0 pasteboard type"] = "image/tiff",
-		["public.jpeg"] = "image/jpeg", ["com.compuserve.gif"] = "image/gif",
-		["public.utf8-plain-text"] = "text/plain", ["public.utf16-plain-text"] = "text/plain",
-		["public.utf16-external-plain-text"] = "text/plain", NSStringPboardType = "text/plain",
-	}
-	local allowed, found, unknown = {}, {}, 0
-	for _, format in ipairs(formats) do
-		allowed[format] = true
-	end
-	for mime in (content or ""):gmatch("[^\r\n]+") do
-		local format = mime:match("^text/plain;") and "text/plain" or mime
-		if backend == "mac" then
-			format = mac_formats[mime] or format
-		end
-		if allowed[format] then
-			found[format] = true
-		else
-			unknown = unknown + 1
-		end
-	end
-	local recognized = {}
-	for _, format in ipairs(formats) do
-		if found[format] then
-			recognized[#recognized + 1] = format
-		end
-	end
-	lines[#lines + 1] = "Clipboard backend: " .. (backend and (backend .. " (readable metadata)") or "unavailable (metadata probe failed or helpers missing)")
-	lines[#lines + 1] = "Formats: " .. (backend and (#recognized > 0 and table.concat(recognized, ", ") or "none recognized") or "unknown")
-	lines[#lines + 1] = "Unrecognized types: " .. (backend and tostring(unknown) or "unknown")
-	if not backend then
-		lines[#lines + 1] = "Check clipboard helper installation and session access; clipboard emptiness is unknown."
-	end
-	if wayland and (not available["wl-copy"] or not available["wl-paste"]) then
-		lines[#lines + 1] = "Wayland copy/paste needs wl-copy and wl-paste; xclip fallback needs X11 session access."
-	elseif x11 and not available.xclip then
-		lines[#lines + 1] = "X11 copy/paste needs xclip; install it or use an accessible Wayland/macOS backend."
-	end
-	if backend == "mac" and not available.pbpaste then
-		lines[#lines + 1] = "macOS plain-text paste needs pbpaste; file/image metadata can still be available."
-	end
-	if not available.realpath or not available.cp or not available.chmod or not available.mktemp then
-		lines[#lines + 1] = "File/image paste needs realpath, cp, chmod and mktemp; restore missing helpers on PATH."
-	end
-	lines[#lines + 1] = "Metadata only: no payload reads or clipboard writes; availability does not verify copying."
-	local report = table.concat(lines, "\n")
-	ya.notify({ title = PackageName .. " doctor", content = report, timeout = 30, level = "info" })
-	return report
-end
-
 local function read_clipboard(mime, backend)
-	if backend == "wayland" then
+	if backend == "windows" then
+		return windows.run(mime == "text/plain" and "text" or "image", {})
+	elseif backend == "wayland" then
 		return command_output("wl-paste", { "--no-newline", "--type", mime })
 	elseif backend == "x11" then
 		return command_output("xclip", { "-selection", "clipboard", "-o", "-t", mime })
@@ -563,7 +427,11 @@ local function decode_file_urls(content)
 end
 
 local function get_clipboard_file_uris(mimetypes, backend)
-	if backend == "mac" then
+	if backend == "windows" then
+		local content = windows.run("files", {})
+		local paths = content and ya.json_decode(content)
+		return type(paths) == "table" and #paths > 0 and paths or nil
+	elseif backend == "mac" then
 		return decode_file_urls(command_output("osascript", { "-l", "JavaScript", "-e", MAC_FILES }))
 	end
 	for _, mime in ipairs({ "code/file-list", "text/uri-list" }) do
@@ -580,7 +448,7 @@ end
 
 -- Filesystem transfers use structured lstat snapshots, never shell traversal.
 local function get_filename_from_path(path)
-	return path:gsub("/+$", ""):match("[^/]+$")
+	return windows and Url(path).name or path:gsub("/+$", ""):match("[^/]+$")
 end
 
 local function transfer_stat(url)
@@ -591,7 +459,52 @@ local function transfer_stat(url)
 	return nil, string.format("Cannot inspect %s: %s", tostring(url), tostring(err))
 end
 
+local function windows_component(name)
+	if name == "" or name:find('[%z\1-\31<>:"|?*]') or name:find("[%. ]$") then
+		return false
+	end
+	local stem = name:match("^([^.]*)"):gsub(" +$", ""):upper()
+	return stem ~= "CON" and stem ~= "PRN" and stem ~= "AUX" and stem ~= "NUL"
+		and stem ~= "CONIN$" and stem ~= "CONOUT$" and stem ~= "CLOCK$"
+		and not stem:match("^COM[1-9]$") and not stem:match("^LPT[1-9]$")
+		and not ((stem:sub(1, 3) == "COM" or stem:sub(1, 3) == "LPT")
+			and (stem:sub(4) == "¹" or stem:sub(4) == "²" or stem:sub(4) == "³"))
+end
+
 local function absolute_path(path)
+	if windows then
+		if type(path) ~= "string" then
+			return nil, "Expected an absolute Windows path"
+		end
+		path = path:gsub("\\", "/")
+		-- Accept only filesystem extended paths, never device namespaces.
+		if path:match("^//%?/UNC/") then
+			path = "//" .. path:sub(9)
+		elseif path:match("^//%?/[A-Za-z]:/") then
+			path = path:sub(5)
+		end
+		local root, rest = path:match("^([A-Za-z]:/)(.*)$")
+		if not root then
+			root, rest = path:match("^(//[^/]+/[^/]+)(.*)$")
+			if root then
+				for component in root:gmatch("[^/]+") do
+					if not windows_component(component) then
+						return nil, "Invalid Windows share root"
+					end
+				end
+			end
+		end
+		if not root then
+			return nil, "Expected an absolute drive or UNC path"
+		end
+		for component in rest:gmatch("[^/]+") do
+			if not windows_component(component) then
+				return nil, "Invalid Windows path component"
+			end
+		end
+		rest = rest:gsub("/+", "/"):gsub("^/", ""):gsub("/$", "")
+		return root .. (rest == "" and "" or ((root:sub(-1) == "/" and "" or "/") .. rest))
+	end
 	if type(path) ~= "string" or path:sub(1, 1) ~= "/" or path:find("\0", 1, true) then
 		return nil, "Expected an absolute local path without NUL bytes"
 	end
@@ -605,6 +518,13 @@ local function absolute_path(path)
 end
 
 local function canonical_path(url)
+	if windows then
+		local out, err = windows.run("canonical", { path = tostring(url) })
+		if not out then
+			return nil, err
+		end
+		return absolute_path(out)
+	end
 	local out = command_output("realpath", { tostring(url) })
 	if not out or out:sub(-1) ~= "\n" then
 		return nil, "Cannot canonicalize " .. tostring(url)
@@ -617,8 +537,19 @@ local function canonical_path(url)
 	return out
 end
 
-local function path_contains(a, b)
-	return a == b or (a == "/" and b:sub(1, 1) == "/") or b:sub(1, #a + 1) == a .. "/"
+local function paths_overlap(a, b)
+	if windows then
+		local result, err = windows.run("overlap", { left = a, right = b })
+		if result ~= "true" and result ~= "false" then
+			return nil, err or "Cannot compare canonical Windows paths"
+		end
+		return result == "true"
+	end
+	local function contains(parent, child)
+		return parent == child or (parent == "/" and child:sub(1, 1) == "/")
+			or child:sub(1, #parent + 1) == parent .. "/"
+	end
+	return contains(a, b) or contains(b, a)
 end
 
 -- Missing components are permitted for text filenames, but neither links
@@ -629,7 +560,7 @@ local function destination_safe(url)
 		local cha, err = transfer_stat(current)
 		if err then
 			return false, err
-		elseif cha and cha.is_link then
+		elseif cha and (cha.is_link or (windows and cha.is_indirect)) then
 			return false, "Destination contains a symlink: " .. tostring(current)
 		elseif current ~= url and cha and not cha.is_dir then
 			return false, "Destination parent is not a directory: " .. tostring(current)
@@ -642,7 +573,7 @@ end
 local function destination_cwd()
 	local chosen = Url(get_cwd())
 	local cha, err = transfer_stat(chosen)
-	if not cha or cha.is_link or not cha.is_dir then
+	if not cha or cha.is_link or (windows and cha.is_indirect) or not cha.is_dir then
 		return nil, err or ("Destination root must be a real directory: " .. tostring(chosen))
 	end
 	-- Resolve aliases above the chosen directory (e.g. macOS /var), not links
@@ -662,7 +593,7 @@ end
 -- Missing or dangling-link leaves use their canonical existing parent.
 -- No failed canonicalization is replaced by an unchecked raw path.
 local function canonical_leaf(url, cha)
-	if cha and not cha.is_link then
+	if cha and not (cha.is_link or (windows and cha.is_indirect)) then
 		return canonical_path(url)
 	end
 	local suffix, current = {}, url
@@ -671,13 +602,13 @@ local function canonical_leaf(url, cha)
 		if err then
 			return nil, err
 		end
-		if info and not (current == url and info.is_link) then
+		if info and not (current == url and (info.is_link or (windows and info.is_indirect))) then
 			local base, cerr = canonical_path(current)
 			if not base then
 				return nil, cerr
 			end
 			for i = #suffix, 1, -1 do
-				base = (base == "/" and "" or base) .. "/" .. suffix[i]
+				base = (base:sub(-1) == "/" and base or base .. "/") .. suffix[i]
 			end
 			return base
 		end
@@ -699,12 +630,15 @@ local function transfer_overlap(source, source_cha, target, target_cha)
 	if not dst then
 		return false, derr
 	end
-	if path_contains(src, dst) or path_contains(dst, src) then
+	local overlap, overlap_err = paths_overlap(src, dst)
+	if overlap == nil then
+		return false, overlap_err
+	elseif overlap then
 		return false, "Source and destination overlap: " .. tostring(target)
 	end
 	-- Also detect resolvable source-link aliases without traversing them
 	-- during copying or requiring realpath of dangling links.
-	if source_cha.is_link then
+	if source_cha.is_link or (windows and source_cha.is_indirect) then
 		local followed, follow_err = fs.cha(source, true)
 		local dangling = follow_err
 			and (follow_err.kind == "NotFound" or follow_err.kind == "NotADirectory")
@@ -715,7 +649,10 @@ local function transfer_overlap(source, source_cha, target, target_cha)
 			if not resolved then
 				return false, rerr
 			end
-			if path_contains(resolved, dst) or path_contains(dst, resolved) then
+			overlap, overlap_err = paths_overlap(resolved, dst)
+			if overlap == nil then
+				return false, overlap_err
+			elseif overlap then
 				return false, "Source and destination overlap through a link: " .. tostring(target)
 			end
 		end
@@ -724,7 +661,7 @@ local function transfer_overlap(source, source_cha, target, target_cha)
 end
 
 local function transfer_kind(cha)
-	if cha.is_link then
+	if cha.is_link or (windows and cha.is_indirect) then
 		return "link"
 	elseif cha.is_dir then
 		return "dir"
@@ -735,7 +672,15 @@ local function transfer_kind(cha)
 end
 
 -- Preserve rwx bits so a staged swap never widens private data.
-local function transfer_mode(cha)
+local function transfer_mode(cha, url)
+	if windows then
+		local content, err = windows.run("metadata", { path = tostring(url) })
+		local mode = content and ya.json_decode(content)
+		if type(mode) ~= "table" or type(mode.sddl) ~= "string" or type(mode.readonly) ~= "boolean" then
+			return nil, err or "Cannot read Windows access permissions"
+		end
+		return mode
+	end
 	local perm = cha:perm()
 	if type(perm) ~= "string" or #perm < 10 then
 		return cha.is_dir and "0700" or "0600"
@@ -759,6 +704,11 @@ local function transfer_mode(cha)
 end
 
 local function transfer_chmod(url, mode)
+	if windows then
+		local operation = type(mode) == "table" and "restore" or "private"
+		local result, err = windows.run(operation, { path = tostring(url), metadata = mode })
+		return result ~= nil, err
+	end
 	if command_output("chmod", { mode, tostring(url) }) == nil then
 		return false, "Cannot set permissions on " .. tostring(url)
 	end
@@ -770,7 +720,14 @@ local function snapshot_tree(url, cha)
 	if not kind then
 		return nil, "Unsupported source type: " .. tostring(url)
 	end
-	local node = { url = url, kind = kind, mode = transfer_mode(cha) }
+	local mode, mode_err
+	if kind ~= "link" then
+		mode, mode_err = transfer_mode(cha, url)
+		if not mode then
+			return nil, mode_err
+		end
+	end
+	local node = { url = url, kind = kind, mode = mode }
 	if kind == "dir" then
 		node.children = {}
 		local files, err = fs.read_dir(url, { resolve = false })
@@ -781,6 +738,8 @@ local function snapshot_tree(url, cha)
 			local name = file.url.name
 			if not name or name == "." or name == ".." or name:find("/", 1, true) then
 				return nil, "Invalid directory entry in " .. tostring(url)
+			elseif windows and not windows_component(name) then
+				return nil, "Invalid Windows directory entry"
 			end
 			local child_cha, stat_err = transfer_stat(file.url)
 			if not child_cha then
@@ -790,7 +749,17 @@ local function snapshot_tree(url, cha)
 			if not child then
 				return nil, cerr
 			end
-			node.children[name] = child
+			local key = name
+			if windows then
+				key, cerr = windows.run("name-key", { name = name })
+				if not key then
+					return nil, cerr
+				elseif node.children[key] then
+					return nil, "Ambiguous case-insensitive Windows directory entries"
+				end
+			end
+			child.name = name
+			node.children[key] = child
 		end
 	end
 	return node
@@ -805,13 +774,17 @@ local function stage_tree(node, destination)
 			return false, tostring(err)
 		end
 		for name, child in pairs(node.children) do
-			local copied, cerr = stage_tree(child, destination:join(name))
+			local copied, cerr = stage_tree(child, destination:join(child.name or name))
 			if not copied then
 				return false, cerr
 			end
 		end
 		return transfer_chmod(destination, node.mode)
 	elseif node.kind == "link" then
+		if windows then
+			local result, err = windows.run("copy-link", { source = tostring(node.url), target = tostring(destination) })
+			return result ~= nil, err
+		end
 		if command_output("cp", { "-P", "--", tostring(node.url), tostring(destination) }) == nil then
 			return false, "Cannot copy source link: " .. tostring(node.url)
 		end
@@ -882,12 +855,15 @@ local function cleanup_stage(stage)
 		local cha, stat_err = transfer_stat(url)
 		if not cha then
 			return false, stat_err or ("Missing staging entry: " .. tostring(url))
-		elseif cha.is_link or not cha.is_dir then
+		elseif cha.is_link or (windows and cha.is_indirect) or (not windows and not cha.is_dir) then
 			return true
 		end
 		local secured, secure_err = transfer_chmod(url, "0700")
 		if not secured then
 			return false, secure_err
+		end
+		if not cha.is_dir then
+			return true
 		end
 		local files, read_err = fs.read_dir(url, { resolve = false })
 		if not files then
@@ -910,6 +886,14 @@ local function cleanup_stage(stage)
 	if not ok then
 		warn("Cannot clean private staging directory %s: %s", tostring(stage), tostring(err))
 	end
+end
+
+local function transfer_rename(source, target)
+	if windows then
+		local result, err = windows.run("move", { source = tostring(source), target = tostring(target) })
+		return result ~= nil, err
+	end
+	return fs.rename(source, target)
 end
 
 -- Stage completely before mutation. Reserve fresh destinations exclusively;
@@ -938,7 +922,7 @@ local function install_tree(tree, target, old_cha)
 	end
 	local reserved
 	if old_cha then
-		local moved, merr = fs.rename(target, backup)
+		local moved, merr = transfer_rename(target, backup)
 		if not moved then
 			cleanup_stage(stage)
 			return nil, "Cannot back up destination: " .. tostring(merr)
@@ -951,17 +935,27 @@ local function install_tree(tree, target, old_cha)
 		end
 		target = reserved
 	end
-	local installed, ierr = fs.rename(payload, target)
+	if windows and reserved then
+		-- Windows cannot rename a directory over its empty reservation.
+		-- Release only our placeholder, then use a no-replace native rename.
+		local removed, remove_err = fs.remove(tree.kind == "dir" and "dir" or "file", reserved)
+		if not removed then
+			cleanup_stage(stage)
+			return nil, "Cannot release reserved destination: " .. tostring(remove_err)
+		end
+		reserved = nil
+	end
+	local installed, ierr = transfer_rename(payload, target)
 	if not installed then
 		if old_cha then
-			local restored, restore_err = fs.rename(backup, target)
+			local restored, restore_err = transfer_rename(backup, target)
 			if not restored then
 				return nil, string.format(
 					"Install failed (%s); rollback failed (%s). Original target retained at %s",
 					tostring(ierr), tostring(restore_err), tostring(backup)
 				)
 			end
-		else
+		elseif reserved then
 			local removed, remove_err = fs.remove(tree.kind == "dir" and "dir" or "file", reserved)
 			if not removed then
 				warn("Cannot remove reserved destination %s: %s", tostring(reserved), tostring(remove_err))
@@ -1162,6 +1156,9 @@ function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hov
 		warn("%s", err)
 		return false
 	end
+	if windows and type(file_name) == "string" then
+		file_name = file_name:gsub("\\", "/")
+	end
 	if type(file_name) ~= "string" or file_name == "" or file_name:sub(1, 1) == "/"
 		or file_name:sub(-1) == "/" or file_name:find("\0", 1, true)
 	then
@@ -1172,6 +1169,10 @@ function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hov
 	for component in file_name:gmatch("[^/]+") do
 		if component == "." or component == ".." then
 			warn("Dot path components are not allowed")
+			return false
+		end
+		if windows and not windows_component(component) then
+			warn("Invalid Windows file name component")
 			return false
 		end
 		target = target:join(component)
@@ -1229,10 +1230,18 @@ function M:save_file_with_conflict_handling(file_name, clipboard_content, no_hov
 		warn("Cannot create destination parent: %s", tostring(make_err))
 		return false
 	end
+	local mode = "0600"
+	if cha then
+		mode, err = transfer_mode(cha, target)
+		if not mode then
+			warn("%s", err)
+			return false
+		end
+	end
 	local tree = {
 		kind = "data",
 		data = clipboard_content,
-		mode = cha and transfer_mode(cha) or "0600",
+		mode = mode,
 	}
 	local final, install_err = install_tree(tree, target, cha)
 	if not final then

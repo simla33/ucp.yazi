@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Standalone, metadata-only clipboard diagnostics; no Yazi runtime required."""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+
+
+PROBE_TIMEOUT = 2
+HELPERS = ("wl-copy", "wl-paste", "xclip", "osascript", "pbpaste",
+           "realpath", "cp", "chmod", "mktemp")
+FORMATS = (
+    "code/file-list", "text/uri-list", "text/plain", "UTF8_STRING", "TEXT", "STRING",
+    "image/png", "image/jpeg", "image/jpg", "image/tiff", "image/gif", "image/bmp",
+    "image/webp", "image/svg+xml", "image/avif",
+)
+MAC_FORMATS = {
+    "public.file-url": "text/uri-list", "NSFilenamesPboardType": "text/uri-list",
+    "public.png": "image/png", "Apple PNG pasteboard type": "image/png",
+    "public.tiff": "image/tiff", "NeXT TIFF v4.0 pasteboard type": "image/tiff",
+    "public.jpeg": "image/jpeg", "com.compuserve.gif": "image/gif",
+    "public.utf8-plain-text": "text/plain", "public.utf16-plain-text": "text/plain",
+    "public.utf16-external-plain-text": "text/plain", "NSStringPboardType": "text/plain",
+}
+WINDOWS_FORMATS = {
+    "FileDrop": "text/uri-list", "Bitmap": "image/png",
+    "DeviceIndependentBitmap": "image/png", "PNG": "image/png", "image/png": "image/png",
+    "UnicodeText": "text/plain", "Text": "text/plain", "OEMText": "text/plain",
+}
+VERSION_PATTERNS = {
+    "wl-copy": ("--version", r"wl-clipboard "),
+    "wl-paste": ("--version", r"wl-clipboard "),
+    "xclip": ("-version", r"xclip version "),
+    "realpath": ("--version", r"realpath \(GNU coreutils\) "),
+    "cp": ("--version", r"cp \(GNU coreutils\) "),
+    "chmod": ("--version", r"chmod \(GNU coreutils\) "),
+    "mktemp": ("--version", r"mktemp \(GNU coreutils\) "),
+}
+NUMERIC_VERSION = r"([0-9]{1,6}(?:\.[0-9]{1,6}){1,3})(?=$|[\s+-])"
+MAC_TYPES = """
+ObjC.import('AppKit');
+function run() {
+    var pb = $.NSPasteboard.generalPasteboard;
+    var types = pb.types;
+    if (!types) return '';
+    var result = [];
+    for (var i = 0; i < types.count; i++)
+        result.push(ObjC.unwrap(types.objectAtIndex(i)));
+    return result.join('\\n');
+}
+"""
+# Windows PowerShell 5.1 syntax only. No clipboard payload method or file writes.
+WINDOWS_METADATA = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$result = @{
+    powershell = $PSVersionTable.PSVersion.ToString()
+    windows = [Environment]::OSVersion.Version.ToString()
+    desktop = [Environment]::UserInteractive -and ([System.Diagnostics.Process]::GetCurrentProcess().SessionId -ne 0)
+    acl = $false
+    metadata = $false
+    formats = @()
+}
+try {
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $result.acl = $null -ne $acl
+} catch {}
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    $clipboard = [System.Windows.Forms.Clipboard]::GetDataObject()
+    if ($null -ne $clipboard) { $result.formats = @($clipboard.GetFormats($false)) }
+    $result.metadata = $true
+} catch {}
+ConvertTo-Json -InputObject $result -Compress -Depth 3
+"""
+
+
+def probe(argv, timeout=PROBE_TIMEOUT):
+    """Capture metadata privately, bounding even a helper with inherited pipes."""
+    try:
+        process = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=(os.name != "nt"),
+        )
+    except (OSError, ValueError):
+        return None
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        process.stdout.close()
+        process.stderr.close()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        return None
+    if process.returncode != 0:
+        return None
+    return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+
+
+def version_from(output, prefix):
+    if output is not None:
+        for stream in output:
+            match = re.match(prefix + NUMERIC_VERSION, stream)
+            if match:
+                return match.group(1)
+    return None
+
+
+def present(name):
+    return bool(os.environ.get(name))
+
+
+def session():
+    wayland, x11 = present("WAYLAND_DISPLAY"), present("DISPLAY")
+    kind = "wayland+x11" if wayland and x11 else "wayland" if wayland else "x11" if x11 else "headless/unknown"
+    ssh = any(present(name) for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"))
+    multiplexer = any(present(name) for name in ("TMUX", "ZELLIJ"))
+    return "Session: %s; ssh=%s; multiplexer=%s" % (kind, "yes" if ssh else "no", "yes" if multiplexer else "no")
+
+
+def format_summary(types, mapping):
+    found, unknown = set(), 0
+    for identifier in types:
+        canonical = mapping.get(identifier, "") if mapping is WINDOWS_FORMATS else mapping.get(identifier, identifier)
+        if canonical.startswith("text/plain;"):
+            canonical = "text/plain"
+        if canonical in FORMATS:
+            found.add(canonical)
+        else:
+            unknown += 1
+    return [name for name in FORMATS if name in found], unknown
+
+
+def clipboard_lines(backend, types, mapping, attempted):
+    if backend is None:
+        state = "failed" if attempted else "unavailable"
+        return [
+            "Clipboard metadata: " + state,
+            "Clipboard backend: unavailable (metadata probe failed)" if attempted else "Clipboard backend: unavailable (helpers missing)",
+            "Formats: unknown", "Unrecognized types: unknown",
+            "Check clipboard helper installation and session access; clipboard emptiness is unknown.",
+        ]
+    recognized, unknown = format_summary(types, mapping)
+    return [
+        "Clipboard metadata: available", "Clipboard backend: " + backend + " (readable metadata)",
+        "Formats: " + (", ".join(recognized) if recognized else "none recognized"),
+        "Unrecognized types: " + str(unknown),
+    ]
+
+
+def posix_report():
+    lines = [session()]
+    # Optional Yazi version lookup never starts an interactive Yazi instance.
+    yazi = shutil.which("yazi")
+    version = version_from(probe([yazi, "--version"]) if yazi else None, r"Yazi(?:\s+Version:)?\s+")
+    lines.append("Yazi: " + (version or "unavailable"))
+    available = {name: shutil.which(name) for name in HELPERS}
+    for name in HELPERS:
+        status = "missing"
+        if available[name]:
+            status = "available (version not probed)"
+            if name in VERSION_PATTERNS:
+                flag, prefix = VERSION_PATTERNS[name]
+                version = version_from(probe([available[name], flag]), prefix)
+                status = "available; version " + version if version else "available (version unavailable)"
+        lines.append(name + ": " + status)
+
+    backend, types, attempted = None, [], False
+    candidates = [("mac", "osascript", ["-l", "JavaScript", "-e", MAC_TYPES])]
+    linux = [("wayland", "wl-paste", ["--list-types"]),
+             ("x11", "xclip", ["-selection", "clipboard", "-o", "-t", "TARGETS"])]
+    if not present("WAYLAND_DISPLAY") and present("DISPLAY"):
+        linux.reverse()
+    for candidate, helper, arguments in candidates + linux:
+        if not available[helper]:
+            continue
+        attempted = True
+        output = probe([available[helper], *arguments])
+        if output is not None:
+            backend, types = candidate, output[0].splitlines()
+            types = [identifier for identifier in types if identifier]
+            break
+    lines.extend(clipboard_lines(backend, types, MAC_FORMATS if backend == "mac" else {}, attempted))
+    if present("WAYLAND_DISPLAY") and not all(available[name] for name in ("wl-copy", "wl-paste")):
+        lines.append("Wayland copy/paste needs wl-copy and wl-paste; xclip fallback needs X11 session access.")
+    elif present("DISPLAY") and not available["xclip"]:
+        lines.append("X11 copy/paste needs xclip; install it or use an accessible Wayland/macOS backend.")
+    if backend == "mac" and not available["pbpaste"]:
+        lines.append("macOS plain-text paste needs pbpaste; file/image metadata can still be available.")
+    if not all(available[name] for name in ("realpath", "cp", "chmod", "mktemp")):
+        lines.append("File/image paste needs realpath, cp, chmod and mktemp; restore missing helpers on PATH.")
+    return lines
+
+
+def windows_report():
+    helper = shutil.which("powershell.exe")
+    lines = ["powershell.exe: " + ("available" if helper else "missing")]
+    result = None
+    if helper:
+        output = probe([helper, "-NoProfile", "-NonInteractive", "-STA", "-Command", WINDOWS_METADATA], timeout=5)
+        if output is not None:
+            try:
+                candidate = json.loads(output[0].lstrip("\ufeff"))
+                if isinstance(candidate, dict):
+                    result = candidate
+            except (ValueError, TypeError):
+                pass
+    result = result or {}
+    for label, key in (("PowerShell", "powershell"), ("Windows", "windows")):
+        value = result.get(key)
+        version = value if isinstance(value, str) and re.fullmatch(r"[0-9]{1,6}(?:\.[0-9]{1,6}){1,3}", value) else "unavailable"
+        lines.append(label + ": " + version)
+    desktop = result.get("desktop")
+    lines.append("Windows desktop session: " + ("available" if desktop is True else "unavailable" if desktop is False else "unknown"))
+    acl = "available (not exercised; transfer unverified)" if result.get("acl") is True else "unavailable (transfer unverified)"
+    lines.append("ACL/native filesystem APIs: " + acl)
+    types = result.get("formats")
+    success = result.get("metadata") is True and isinstance(types, list) and all(isinstance(item, str) for item in types)
+    lines.extend(clipboard_lines("windows" if success else None, types if success else [], WINDOWS_FORMATS, bool(helper)))
+    return lines
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="ucp", description="Standalone clipboard metadata diagnostics.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("doctor", help="report helper and clipboard metadata without reading payloads")
+    parser.parse_args()
+    lines = ["ucp doctor (metadata only)"]
+    lines.extend(windows_report() if sys.platform == "win32" else posix_report())
+    lines.append("Metadata only: no payload reads or clipboard writes; availability does not verify copying.")
+    print("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()

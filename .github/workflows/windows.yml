@@ -1,0 +1,69 @@
+name: Native Windows
+
+on:
+  push:
+    branches: [main, feat/windows-support]
+    paths:
+      - main.lua
+      - windows.lua
+      - ucp
+      - tests/**
+      - .github/workflows/windows.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install pinned ConPTY dependency
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: pywinpty==3.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'pywinpty installation failed' }
+      - name: Install official Yazi 26.9.1 Windows release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'yazi-26.9.1.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'yazi-26.9.1'
+          # Asset name and SHA-256 from the official v26.9.1 GitHub release metadata.
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/sxyazi/yazi/releases/download/v26.9.1/yazi-x86_64-pc-windows-msvc.zip' -OutFile $archive
+          $expected = '7c033e5f2de6355fd03d865319053fc97db780275974ed17653c057f5d0f8d21'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Yazi release archive checksum mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $binaries = @(Get-ChildItem -LiteralPath $destination -Filter yazi.exe -Recurse -File)
+          if ($binaries.Count -ne 1) { throw 'Expected one official yazi.exe' }
+          $bin = $binaries[0].Directory.FullName
+          if (-not (Test-Path -LiteralPath (Join-Path $bin 'ya.exe'))) { throw 'Official ya.exe missing' }
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $binaries[0].FullName --version
+          if ($LASTEXITCODE -ne 0) { throw 'Yazi version query failed' }
+          if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+            throw 'Native verification requires Windows PowerShell 5.1'
+          }
+      - name: Verify normal discovery is clipboard-safe
+        run: |
+          Remove-Item Env:UCP_WINDOWS_TESTS -ErrorAction SilentlyContinue
+          python -m unittest discover -s tests -p test_windows_native.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Opt-out discovery failed' }
+      - name: Run real Yazi and WinForms consumer suite
+        env:
+          # Hosted runner is disposable; never enable this on a developer desktop.
+          UCP_WINDOWS_TESTS: '1'
+          PYTHONUTF8: '1'
+          PYWINPTY_BACKEND: '0'
+        run: |
+          python -m unittest discover -s tests -p test_windows_native.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows integration failed' }
